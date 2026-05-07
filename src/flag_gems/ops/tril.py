@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 @libentry()
-@triton.autotune(configs=runtime.get_tuned_config("tril"), key=["M", "N"])
-@triton.jit(do_not_specialize=["diag"])
+@triton.autotune(configs=runtime.get_tuned_config("tril"), key=["M", "N", "B", "ELEM_BYTES"])
+@triton.jit(do_not_specialize=["diag", "ELEM_BYTES"])
 def tril_kernel(
     X,
     Y,
@@ -22,6 +22,7 @@ def tril_kernel(
     N,
     B,
     diag,
+    ELEM_BYTES,
     IS_INPLACE: tl.constexpr,
     ITER_COL: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -39,12 +40,13 @@ def tril_kernel(
         block_min_row = row_start
         block_max_row = tl.minimum(block_min_row + BLOCK_M - 1, M - 1)
         base = pid_b * M * N
+        row_base = base + offs_m * N
 
         for col_start in range(0, N, BLOCK_N):
             offs_n = col_start + tl.arange(0, BLOCK_N)[None, :]
             col_mask = offs_n < N
             mask = row_mask & col_mask
-            idxs = base + offs_m * N + offs_n
+            idxs = row_base + offs_n
 
             block_min_col = col_start
             block_max_col = tl.minimum(col_start + BLOCK_N - 1, N - 1)
@@ -58,6 +60,9 @@ def tril_kernel(
                     tl.store(Y + idxs, x, mask=mask)
             elif all_above:
                 tl.store(Y + idxs, 0.0, mask=mask)
+            elif IS_INPLACE:
+                zero_above = offs_n > (offs_m + diag)
+                tl.store(Y + idxs, 0.0, mask=mask & zero_above)
             else:
                 keep = offs_n <= (offs_m + diag)
                 load_mask = mask & keep
@@ -133,6 +138,29 @@ def _check_batch_contiguous(tensor, allow_zero_stride=True):
     return True, tensor
 
 
+def _launch_tril_kernel(X, Y, M, N, B, diagonal, elem_bytes, is_inplace, iter_col):
+    if iter_col:
+        max_relevant = max(0, N - diagonal)
+        effective_rows = min(M, max_relevant)
+        if B == 1 and effective_rows == M and N >= M and M >= 512:
+            grid = lambda meta: (
+                triton.cdiv(M, meta["BLOCK_M"]),
+                triton.cdiv(N, meta["BLOCK_N"]),
+                1,
+            )
+            tril_kernel[grid](X, Y, M, N, 1, diagonal, elem_bytes, is_inplace, False)
+            return
+        grid = lambda meta: (triton.cdiv(effective_rows, meta["BLOCK_M"]) * B,)
+        tril_kernel[grid](X, Y, M, N, B, diagonal, elem_bytes, is_inplace, True)
+    else:
+        grid = lambda meta: (
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+            B,
+        )
+        tril_kernel[grid](X, Y, M, N, B, diagonal, elem_bytes, is_inplace, False)
+
+
 def tril(A, diagonal=0):
     logger.debug("GEMS TRIL")
 
@@ -146,14 +174,10 @@ def tril(A, diagonal=0):
 
     M, N = A_input.shape[-2:]
     B = A_input.numel() // (M * N)
+    elem_bytes = A_input.dtype.itemsize
 
     with torch_device_fn.device(A_input.device):
-        grid = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-            B,
-        )
-        tril_kernel[grid](A_input, out, M, N, B, diagonal, False, False)
+        _launch_tril_kernel(A_input, out, M, N, B, diagonal, elem_bytes, False, False)
 
     return out
 
@@ -167,6 +191,7 @@ def tril_(A, diagonal=0):
     B = A.numel() // (M * N)
 
     can_use_directly, A_to_use = _check_batch_contiguous(A, allow_zero_stride=True)
+    elem_bytes = A.dtype.itemsize
 
     if not can_use_directly:
         logger.debug(
@@ -177,12 +202,7 @@ def tril_(A, diagonal=0):
         result_temp = torch.empty_like(A_to_use, memory_format=torch.contiguous_format)
 
         with torch_device_fn.device(A.device):
-            grid = lambda meta: (
-                triton.cdiv(M, meta["BLOCK_M"]),
-                triton.cdiv(N, meta["BLOCK_N"]),
-                B,
-            )
-            tril_kernel[grid](A_to_use, result_temp, M, N, B, diagonal, False, False)
+            _launch_tril_kernel(A_to_use, result_temp, M, N, B, diagonal, elem_bytes, False, False)
 
         A.copy_(result_temp)
     else:
@@ -191,8 +211,7 @@ def tril_(A, diagonal=0):
             effective_rows = min(M, max_relevant)
             if effective_rows <= 0:
                 return A
-            grid = lambda meta: (triton.cdiv(effective_rows, meta["BLOCK_M"]) * B,)
-            tril_kernel[grid](A, A, M, N, B, diagonal, True, True)
+            _launch_tril_kernel(A, A, M, N, B, diagonal, elem_bytes, True, True)
 
     return A
 

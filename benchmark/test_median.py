@@ -5,11 +5,23 @@ import torch
 
 from . import base, consts
 
+# Benchmark shapes organized by input dimension and size category
+BENCH_SHAPES = {
+    "1d": [(8,), (64,), (1024,), (4096,), (32768,)],
+    "2d_small": [(1, 1), (8, 8), (16, 32), (32, 64), (7, 13), (37, 99)],
+    "2d_regular": [(64, 64), (256, 128), (128, 256), (77, 233)],
+    "2d_large": [(1024, 1024), (1024, 2048), (333, 1333)],
+    "3d": [(8, 32, 64), (32, 128, 512), (16, 64, 1024), (11, 23, 47)],
+    "4d": [(2, 4, 8, 16), (4, 8, 16, 512), (4, 8, 16, 1024), (3, 5, 7, 11)],
+    "5d": [(2, 2, 4, 8, 16), (2, 4, 8, 16, 512), (2, 3, 5, 7, 13)],
+}
+
 
 class MedianBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
     MAX_N = 2**20
-    MAX_BITONIC_M = 1024
+    MAX_BITONIC_M = 256
+    MAX_TOTAL_ELEMS = 4 * 1024 * 1024
 
     def set_shapes(self, shape_file_path=None):
         super().set_shapes(shape_file_path)
@@ -19,27 +31,18 @@ class MedianBenchmark(base.Benchmark):
                 continue
             N = shape[-1]
             M = math.prod(shape[:-1]) if len(shape) > 1 else 1
-            if N <= 1024 and M > self.MAX_BITONIC_M:
+            if N <= 1024 and M > 16 * 1024:
                 continue
-            if len(shape) >= 3 and N <= 1024 and M > 1024:
+            if math.prod(shape) > self.MAX_TOTAL_ELEMS:
                 continue
             filtered.append(shape)
         self.shapes = filtered
 
     def set_more_shapes(self):
-        bitonic_2d = [
-            (256, 64),
-            (512, 128),
-            (768, 256),
-        ]
-        sort_2d = [
-            (1024, 2048),
-            (512, 4096),
-            (256, 8192),
-            (128, 16384),
-            (64, 32768),
-        ]
-        return bitonic_2d + sort_2d
+        shapes = []
+        for cat in ["1d", "2d_small", "2d_regular", "2d_large", "3d", "4d", "5d"]:
+            shapes.extend(BENCH_SHAPES[cat])
+        return shapes
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -49,7 +52,10 @@ class MedianBenchmark(base.Benchmark):
     def get_input_iter(self, cur_dtype):
         for shape in self.shapes:
             inp = base.generate_tensor_input(shape, cur_dtype, self.device)
-            yield inp, -1
+            if inp.ndim > 1:
+                yield inp, -1
+            else:
+                yield inp,
 
 
 @pytest.mark.median

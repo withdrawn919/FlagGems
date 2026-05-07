@@ -1197,6 +1197,46 @@ triu_batch:
       - 8
       - 16
       - 32
+tril:
+  - gen: true
+    param_map:
+      META:
+        M_BLOCK_SIZE: block_m
+        N_BLOCK_SIZE: block_n
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    block_m:
+      - 1
+      - 8
+      - 32
+      - 128
+    block_n:
+      - 32
+      - 128
+      - 512
+      - 2048
+tril_batch:
+  - gen: true
+    param_map:
+      META:
+        BATCH_BLOCK_SIZE: batch_block
+        MN_BLOCK_SIZE: mn_block
+      num_warps: warps
+    warps:
+      - 4
+      - 8
+      - 16
+    batch_block:
+      - 1
+      - 4
+      - 16
+    mn_block:
+      - 256
+      - 1024
+      - 4096
 weight_norm_kernel_last:
   - gen: true
     param_map:

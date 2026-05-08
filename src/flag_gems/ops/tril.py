@@ -75,6 +75,7 @@ def tril_batch_kernel(
     MN,
     N,
     diagonal,
+    IS_INPLACE: tl.constexpr,
     BATCH_BLOCK_SIZE: tl.constexpr,
     MN_BLOCK_SIZE: tl.constexpr,
 ):
@@ -88,11 +89,16 @@ def tril_batch_kernel(
     cols = mn_id * MN_BLOCK_SIZE + tl.arange(0, MN_BLOCK_SIZE)[None, :]
     mn_mask = cols < MN
     mask = batch_mask & mn_mask
-    x = tl.load(X + cols, mask, other=0.0)
     m = cols // N
     n = cols % N
-    y = tl.where(n <= m + diagonal, x, 0.0)
-    tl.store(Y + cols, y, mask=mask)
+
+    if IS_INPLACE:
+        zero_above = n > (m + diagonal)
+        tl.store(Y + cols, 0.0, mask=mask & zero_above)
+    else:
+        x = tl.load(X + cols, mask, other=0.0)
+        y = tl.where(n <= m + diagonal, x, 0.0)
+        tl.store(Y + cols, y, mask=mask)
 
 
 def _check_batch_contiguous(tensor, allow_zero_stride=True):
@@ -152,7 +158,7 @@ def tril(A, diagonal=0):
                 triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
                 triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
             )
-            tril_batch_kernel[grid](B, out, batch, M * N, N, diagonal)
+            tril_batch_kernel[grid](B, out, batch, M * N, N, diagonal, False)
             out = out.view(A.shape)
 
     return out
@@ -187,7 +193,7 @@ def tril_(A, diagonal=0):
                     triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
                     triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
                 )
-                tril_batch_kernel[grid](B, result_temp_flat, batch, M * N, N, diagonal)
+                tril_batch_kernel[grid](B, result_temp_flat, batch, M * N, N, diagonal, False)
 
         A.copy_(result_temp)
     else:
@@ -202,7 +208,7 @@ def tril_(A, diagonal=0):
                     triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
                     triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
                 )
-                tril_batch_kernel[grid](B, B, batch, M * N, N, diagonal)
+                tril_batch_kernel[grid](B, B, batch, M * N, N, diagonal, True)
 
     return A
 

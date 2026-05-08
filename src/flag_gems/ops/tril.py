@@ -21,23 +21,45 @@ def tril_kernel(
     M,
     N,
     diagonal,
+    IS_INPLACE: tl.constexpr,
     M_BLOCK_SIZE: tl.constexpr,
     N_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tle.program_id(0)
-    row = pid * M_BLOCK_SIZE + tl.arange(0, M_BLOCK_SIZE)[:, None]
-    m_mask = row < M
-    X += row * N
-    Y += row * N
+    row_start = pid * M_BLOCK_SIZE
+    offs_m = row_start + tl.arange(0, M_BLOCK_SIZE)[:, None]
+    m_mask = offs_m < M
 
-    for n_offset in range(0, N, N_BLOCK_SIZE):
-        cols = n_offset + tl.arange(0, N_BLOCK_SIZE)[None, :]
-        n_mask = cols < N
-        mask = m_mask and n_mask
+    block_min_row = row_start
+    block_max_row = tl.minimum(block_min_row + M_BLOCK_SIZE - 1, M - 1)
 
-        x = tl.load(X + cols, mask, other=0.0)
-        y = tl.where(cols <= row + diagonal, x, 0.0)
-        tl.store(Y + cols, y, mask=mask)
+    X += offs_m * N
+    Y += offs_m * N
+
+    for n_start in range(0, N, N_BLOCK_SIZE):
+        offs_n = n_start + tl.arange(0, N_BLOCK_SIZE)[None, :]
+        n_mask = offs_n < N
+        mask = m_mask & n_mask
+
+        block_min_col = n_start
+        block_max_col = tl.minimum(n_start + N_BLOCK_SIZE - 1, N - 1)
+
+        all_above = block_min_col > block_max_row + diagonal
+        all_below = block_max_col <= block_min_row + diagonal
+
+        if all_below:
+            if not IS_INPLACE:
+                x = tl.load(X + offs_n, mask=mask, other=0.0)
+                tl.store(Y + offs_n, x, mask=mask)
+        elif all_above:
+            tl.store(Y + offs_n, 0.0, mask=mask)
+        elif IS_INPLACE:
+            zero_above = offs_n > (offs_m + diagonal)
+            tl.store(Y + offs_n, 0.0, mask=mask & zero_above)
+        else:
+            x = tl.load(X + offs_n, mask=mask, other=0.0)
+            y = tl.where(offs_n <= (offs_m + diagonal), x, 0.0)
+            tl.store(Y + offs_n, y, mask=mask)
 
 
 @libentry()
@@ -65,7 +87,7 @@ def tril_batch_kernel(
 
     cols = mn_id * MN_BLOCK_SIZE + tl.arange(0, MN_BLOCK_SIZE)[None, :]
     mn_mask = cols < MN
-    mask = batch_mask and mn_mask
+    mask = batch_mask & mn_mask
     x = tl.load(X + cols, mask, other=0.0)
     m = cols // N
     n = cols % N
@@ -122,7 +144,7 @@ def tril(A, diagonal=0):
     with torch_device_fn.device(A_input.device):
         if len(A_input.shape) == 2:
             grid = lambda meta: (triton.cdiv(M, meta["M_BLOCK_SIZE"]),)
-            tril_kernel[grid](A_input, out, M, N, diagonal)
+            tril_kernel[grid](A_input, out, M, N, diagonal, False)
         else:
             batch = int(torch.numel(A_input) / M / N)
             B = A_input.view(batch, -1)
@@ -156,7 +178,7 @@ def tril_(A, diagonal=0):
         with torch_device_fn.device(A.device):
             if len(A.shape) == 2:
                 grid = lambda meta: (triton.cdiv(M, meta["M_BLOCK_SIZE"]),)
-                tril_kernel[grid](A_to_use, result_temp, M, N, diagonal)
+                tril_kernel[grid](A_to_use, result_temp, M, N, diagonal, False)
             else:
                 batch = int(torch.numel(A) / M / N)
                 B = A_to_use.view(batch, -1)
@@ -172,7 +194,7 @@ def tril_(A, diagonal=0):
         with torch_device_fn.device(A.device):
             if len(A.shape) == 2:
                 grid = lambda meta: (triton.cdiv(M, meta["M_BLOCK_SIZE"]),)
-                tril_kernel[grid](A, A, M, N, diagonal)
+                tril_kernel[grid](A, A, M, N, diagonal, True)
             else:
                 batch = int(torch.numel(A) / M / N)
                 B = A.view(batch, -1)

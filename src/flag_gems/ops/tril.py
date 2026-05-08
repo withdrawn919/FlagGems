@@ -64,6 +64,56 @@ def tril_kernel(
 
 @libentry()
 @triton.autotune(
+    configs=runtime.get_tuned_config("tril_batch_folded"),
+    key=["effective_rows", "N", "batch"],
+)
+@triton.jit(do_not_specialize=["diagonal"])
+def tril_batch_folded_kernel(
+    X,
+    M_orig,
+    N,
+    batch,
+    effective_rows,
+    diagonal,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    grid_m = tl.cdiv(effective_rows, BLOCK_M)
+    pid_b = pid // grid_m
+    pid_m = pid % grid_m
+
+    row_start = pid_m * BLOCK_M
+    offs_m = row_start + tl.arange(0, BLOCK_M)[:, None]
+    m_mask = offs_m < effective_rows
+
+    block_min_row = row_start
+    block_max_row = tl.minimum(row_start + BLOCK_M - 1, effective_rows - 1)
+
+    X += pid_b * M_orig * N + offs_m * N
+
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)[None, :]
+        n_mask = offs_n < N
+        mask = m_mask & n_mask
+
+        block_min_col = n_start
+        block_max_col = tl.minimum(n_start + BLOCK_N - 1, N - 1)
+
+        all_above = block_min_col > block_max_row + diagonal
+        all_below = block_max_col <= block_min_row + diagonal
+
+        if all_below:
+            pass
+        elif all_above:
+            tl.store(X + offs_n, 0.0, mask=mask)
+        else:
+            zero_above = offs_n > (offs_m + diagonal)
+            tl.store(X + offs_n, 0.0, mask=mask & zero_above)
+
+
+@libentry()
+@triton.autotune(
     configs=runtime.get_tuned_config("tril_batch"),
     key=["batch", "MN", "N", "diagonal"],
 )
@@ -218,15 +268,25 @@ def tril_(A, diagonal=0):
                     effective_rows, N, diagonal, True,
                 )
             else:
-                batch = int(torch.numel(A) / M / N)
-                B = A.view(batch, -1)
-                grid = lambda meta: (
-                    triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
-                    triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
-                )
-                tril_batch_kernel[grid](
-                    B, B, batch, M * N, N, diagonal, True,
-                )
+                if effective_rows < M:
+                    A_flat = A.view(-1, M, N)
+                    batch = A_flat.shape[0]
+                    grid = lambda meta: (
+                        triton.cdiv(effective_rows, meta["BLOCK_M"]) * batch,
+                    )
+                    tril_batch_folded_kernel[grid](
+                        A_flat, M, N, batch, effective_rows, diagonal,
+                    )
+                else:
+                    batch = int(torch.numel(A) / M / N)
+                    B = A.view(batch, -1)
+                    grid = lambda meta: (
+                        triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
+                        triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
+                    )
+                    tril_batch_kernel[grid](
+                        B, B, batch, M * N, N, diagonal, True,
+                    )
 
     return A
 

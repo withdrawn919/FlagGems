@@ -1746,6 +1746,26 @@ tril:
   - 128
   - 512
   - 2048
+tril_batch_folded:
+- gen: true
+  param_map:
+    META:
+      BLOCK_M: block_m
+      BLOCK_N: block_n
+    num_warps: warps
+  warps:
+  - 4
+  - 8
+  - 16
+  block_m:
+  - 16
+  - 32
+  - 64
+  - 128
+  block_n:
+  - 32
+  - 128
+  - 512
 tril_batch:
 - gen: true
   param_map:

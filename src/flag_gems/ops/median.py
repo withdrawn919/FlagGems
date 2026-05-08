@@ -5,10 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops.topk import _get_finfo_val, _get_iinfo_val, argsort
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as tle
-from flag_gems.ops.topk import _get_finfo_val, _get_iinfo_val, argsort
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,13 @@ def median_dim(inp, dim=None, keepdim=False):
         grid_size = min(M, MAX_GRID)
         with torch_device_fn.device(inp.device):
             median_dim_kernel[(grid_size,)](
-                inp_2d, out_value.view(-1), out_index.view(-1), N, M, BLOCK_SIZE, is_float
+                inp_2d,
+                out_value.view(-1),
+                out_index.view(-1),
+                N,
+                M,
+                BLOCK_SIZE,
+                is_float,
             )
 
         if not keepdim:

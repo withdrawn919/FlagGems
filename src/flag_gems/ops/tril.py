@@ -171,6 +171,13 @@ def tril_(A, diagonal=0):
     diagonal = int(diagonal)
     M, N = A.shape[-2:]
 
+    # effective_rows: only rows 0..effective_rows-1 have elements above diagonal
+    # rows >= effective_rows are entirely below diagonal → no change for inplace
+    max_relevant = max(0, N - diagonal)
+    effective_rows = min(M, max_relevant)
+    if effective_rows <= 0:
+        return A
+
     can_use_directly, A_to_use = _check_batch_contiguous(A, allow_zero_stride=True)
 
     if not can_use_directly:
@@ -183,24 +190,33 @@ def tril_(A, diagonal=0):
 
         with torch_device_fn.device(A.device):
             if len(A.shape) == 2:
-                grid = lambda meta: (triton.cdiv(M, meta["M_BLOCK_SIZE"]),)
-                tril_kernel[grid](A_to_use, result_temp, M, N, diagonal, False)
+                grid = lambda meta: (triton.cdiv(effective_rows, meta["M_BLOCK_SIZE"]),)
+                tril_kernel[grid](
+                    A_to_use[:effective_rows], result_temp[:effective_rows],
+                    effective_rows, N, diagonal, False,
+                )
+                result_temp[effective_rows:].copy_(A_to_use[effective_rows:])
             else:
-                batch = int(torch.numel(A) / M / N)
+                batch = int(torch.numel(A_to_use) / M / N)
                 B = A_to_use.view(batch, -1)
                 result_temp_flat = result_temp.view(batch, -1)
                 grid = lambda meta: (
                     triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
                     triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
                 )
-                tril_batch_kernel[grid](B, result_temp_flat, batch, M * N, N, diagonal, False)
+                tril_batch_kernel[grid](
+                    B, result_temp_flat, batch, M * N, N, diagonal, False
+                )
 
         A.copy_(result_temp)
     else:
         with torch_device_fn.device(A.device):
             if len(A.shape) == 2:
-                grid = lambda meta: (triton.cdiv(M, meta["M_BLOCK_SIZE"]),)
-                tril_kernel[grid](A, A, M, N, diagonal, True)
+                grid = lambda meta: (triton.cdiv(effective_rows, meta["M_BLOCK_SIZE"]),)
+                tril_kernel[grid](
+                    A[:effective_rows], A[:effective_rows],
+                    effective_rows, N, diagonal, True,
+                )
             else:
                 batch = int(torch.numel(A) / M / N)
                 B = A.view(batch, -1)
@@ -208,7 +224,9 @@ def tril_(A, diagonal=0):
                     triton.cdiv(batch, meta["BATCH_BLOCK_SIZE"]),
                     triton.cdiv(M * N, meta["MN_BLOCK_SIZE"]),
                 )
-                tril_batch_kernel[grid](B, B, batch, M * N, N, diagonal, True)
+                tril_batch_kernel[grid](
+                    B, B, batch, M * N, N, diagonal, True,
+                )
 
     return A
 

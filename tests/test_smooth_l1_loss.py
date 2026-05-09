@@ -142,6 +142,7 @@ def test_smooth_l1_loss_small_diff(dtype, reduction):
 
     utils.gems_assert_close(res_out, ref_out, dtype, equal_nan=True)
 
+
 # ===========================================================================
 # smooth_l1_loss.out — out variant
 # ===========================================================================

@@ -46,6 +46,7 @@ def test_smooth_l1_loss_backward(shape, dtype, reduction, beta):
 
     utils.gems_assert_close(gem_grad, ref_grad, dtype, equal_nan=True)
 
+
 # ===========================================================================
 # smooth_l1_loss_backward.grad_input — out variant
 # ===========================================================================

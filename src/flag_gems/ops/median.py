@@ -119,5 +119,7 @@ def median_dim_values(inp, dim, keepdim=False, *, values=None, indices=None):
         values.copy_(result.values)
     if indices is not None:
         indices.copy_(result.indices)
-    return (values if values is not None else result.values,
-            indices if indices is not None else result.indices)
+    return (
+        values if values is not None else result.values,
+        indices if indices is not None else result.indices,
+    )

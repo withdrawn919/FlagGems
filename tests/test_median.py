@@ -169,6 +169,103 @@ def test_median_dim_edge_n1(shape, dim, dtype):
     _run_median_dim_test(shape, dim, keepdim=False, dtype=dtype)
 
 
+# ===========================================================================
+# median.out — out variant of default median
+# ===========================================================================
+@pytest.mark.median_out
+@pytest.mark.parametrize("shape", SIZES_1D + SIZES_2D[:3])
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+def test_median_out(shape, dtype):
+    if dtype in FLOAT_DTYPES:
+        inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    else:
+        inp = torch.randint(-10000, 10000, shape, dtype=dtype, device="cpu").to(
+            flag_gems.device
+        )
+    ref_inp = utils.to_reference(inp)
+
+    # Reference
+    ref_out = torch.empty([], dtype=dtype, device=ref_inp.device)
+    torch.ops.aten.median.out(ref_inp, out=ref_out)
+
+    # FlagGems
+    out = torch.empty([], dtype=dtype, device=flag_gems.device)
+    with flag_gems.use_gems():
+        torch.ops.aten.median.out(inp, out=out)
+    utils.gems_assert_equal(out, ref_out)
+
+
+# ===========================================================================
+# median.dim_values — out variant of dim median
+# ===========================================================================
+@pytest.mark.median_dim_values
+@pytest.mark.parametrize("shape", SIZES_SMALL + SIZES_REGULAR[:1])
+@pytest.mark.parametrize("dim", DIMS_2D)
+@pytest.mark.parametrize("keepdim", KEEPDIM)
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+def test_median_dim_values(shape, dim, keepdim, dtype):
+    if dtype in FLOAT_DTYPES:
+        inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    else:
+        inp = torch.randint(-10000, 10000, shape, dtype=dtype, device="cpu").to(
+            flag_gems.device
+        )
+    ref_inp = utils.to_reference(inp)
+
+    # Compute expected output shape
+    _dim = dim % inp.ndim
+    out_shape = list(inp.shape)
+    out_shape[_dim] = 1
+
+    if not keepdim:
+        ref_out = torch.median(ref_inp, dim=dim, keepdim=False)
+        out_shape_ref = list(inp.shape)
+        out_shape_ref.pop(_dim)
+    else:
+        ref_out = torch.median(ref_inp, dim=dim, keepdim=True)
+
+    # Reference via ATen
+    ref_values = torch.empty(
+        out_shape if keepdim else out_shape_ref,
+        dtype=dtype,
+        device=ref_inp.device,
+    )
+    ref_indices = torch.empty(
+        out_shape if keepdim else out_shape_ref,
+        dtype=torch.long,
+        device=ref_inp.device,
+    )
+    torch.ops.aten.median.dim_values(
+        ref_inp, dim, keepdim, values=ref_values, indices=ref_indices
+    )
+
+    # FlagGems
+    values = torch.empty(
+        out_shape if keepdim else out_shape_ref,
+        dtype=dtype,
+        device=flag_gems.device,
+    )
+    indices = torch.empty(
+        out_shape if keepdim else out_shape_ref,
+        dtype=torch.long,
+        device=flag_gems.device,
+    )
+    with flag_gems.use_gems():
+        torch.ops.aten.median.dim_values(
+            inp, dim, keepdim, values=values, indices=indices
+        )
+
+    utils.gems_assert_equal(values, ref_out.values)
+    # Validate index correctness
+    res_idx = indices
+    if res_idx.ndim < inp.ndim:
+        res_idx = res_idx.unsqueeze(dim)
+    gathered = inp.gather(dim, res_idx.to(inp.device))
+    if not keepdim and gathered.ndim > values.ndim:
+        gathered = gathered.squeeze(dim)
+    utils.gems_assert_equal(gathered, values)
+
+
 def _run_median_dim_test(shape, dim, keepdim, dtype):
     if dtype in FLOAT_DTYPES:
         inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)

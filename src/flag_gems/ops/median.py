@@ -63,6 +63,13 @@ def median(inp):
     return out.values
 
 
+def median_out(inp, *, out):
+    logger.debug("GEMS MEDIAN OUT")
+    result = median(inp)
+    out.copy_(result)
+    return out
+
+
 def median_dim(inp, dim=None, keepdim=False):
     logger.debug("GEMS MEDIAN DIM")
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
@@ -103,3 +110,14 @@ def median_dim(inp, dim=None, keepdim=False):
 
     Median_out = namedtuple("median", ["values", "indices"])
     return Median_out(values=out_value, indices=out_index)
+
+
+def median_dim_values(inp, dim, keepdim=False, *, values=None, indices=None):
+    logger.debug("GEMS MEDIAN DIM_VALUES")
+    result = median_dim(inp, dim, keepdim=keepdim)
+    if values is not None:
+        values.copy_(result.values)
+    if indices is not None:
+        indices.copy_(result.indices)
+    return (values if values is not None else result.values,
+            indices if indices is not None else result.indices)

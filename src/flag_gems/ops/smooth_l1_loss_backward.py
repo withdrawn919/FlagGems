@@ -9,8 +9,19 @@ from flag_gems import runtime
 log = logging.getLogger(__name__)
 
 
+_smooth_l1_loss_backward_configs = runtime.get_tuned_config("smooth_l1_loss_backward")
+if not _smooth_l1_loss_backward_configs:
+    _smooth_l1_loss_backward_configs = [
+        triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
+        triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
+        triton.Config({"BLOCK_SIZE": 4096}, num_warps=16),
+    ]
+
+
 @triton.autotune(
-    configs=runtime.get_tuned_config("smooth_l1_loss_backward"),
+    configs=_smooth_l1_loss_backward_configs,
     key=["n_elements"],
 )
 @triton.jit

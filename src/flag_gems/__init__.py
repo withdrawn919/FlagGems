@@ -453,6 +453,7 @@ _FULL_CONFIG = (
     ("tile", tile),
     ("topk", topk),
     ("trace", trace),
+    ("svd", svd),
     ("tril", tril),
     ("triu", triu),
     ("triu_", triu_),

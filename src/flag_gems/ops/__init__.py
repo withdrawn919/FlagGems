@@ -302,6 +302,7 @@ from flag_gems.ops.tile import tile
 from flag_gems.ops.to import to_copy
 from flag_gems.ops.topk import topk
 from flag_gems.ops.trace import trace
+from flag_gems.ops.svd import svd
 from flag_gems.ops.tril import tril, tril_out
 from flag_gems.ops.triu import triu, triu_
 from flag_gems.ops.unfold_backward import unfold_backward
@@ -719,6 +720,7 @@ __all__ = [
     "sum_dim",
     "sum_dim_out",
     "sum_out",
+    "svd",
     "ScaleDotProductAttention",
     "SUPPORTED_FP8_DTYPE",
     "t_copy",

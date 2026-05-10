@@ -144,7 +144,7 @@ def test_median_dim_ties(shape, dim, dtype):
     gathered = inp.gather(dim, res_idx.to(inp.device))
     if res_out.values.ndim < gathered.ndim:
         gathered = gathered.squeeze(dim)
-    utils.gems_assert_equal(gathered, res_out.values)
+    utils.gems_assert_equal(gathered, utils.to_reference(res_out.values))
 
 
 # ===========================================================================
@@ -264,7 +264,7 @@ def test_median_dim_values(shape, dim, keepdim, dtype):
     gathered = inp.gather(dim, res_idx.to(inp.device))
     if not keepdim and gathered.ndim > values.ndim:
         gathered = gathered.squeeze(dim)
-    utils.gems_assert_equal(gathered, values)
+    utils.gems_assert_equal(gathered, utils.to_reference(values))
 
 
 def _run_median_dim_test(shape, dim, keepdim, dtype):
@@ -287,4 +287,4 @@ def _run_median_dim_test(shape, dim, keepdim, dtype):
     gathered = inp.gather(dim, res_idx.to(inp.device))
     if not keepdim and gathered.ndim > res_out.values.ndim:
         gathered = gathered.squeeze(dim)
-    utils.gems_assert_equal(gathered, res_out.values)
+    utils.gems_assert_equal(gathered, utils.to_reference(res_out.values))

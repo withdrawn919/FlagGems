@@ -106,7 +106,9 @@ def test_accuracy_smooth_l1_loss_backward_identical(shape, dtype, reduction, bet
 @pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
 @pytest.mark.parametrize("shape", [(64, 64)])
 def test_accuracy_smooth_l1_loss_backward_large_diff(shape, dtype, reduction, beta):
-    inp = torch.full(shape, 100.0, dtype=dtype, device=flag_gems.device).requires_grad_()
+    inp = torch.full(
+        shape, 100.0, dtype=dtype, device=flag_gems.device
+    ).requires_grad_()
     target = torch.zeros(shape, dtype=dtype, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True).clone().detach().requires_grad_()
     ref_target = utils.to_reference(target, True).clone().detach()
@@ -195,9 +197,7 @@ def test_accuracy_smooth_l1_loss_backward_out_identical(shape, dtype, reduction,
 @pytest.mark.parametrize("reduction", [1, 2])
 @pytest.mark.parametrize("beta", [0.5, 1.0, 2.0])
 @pytest.mark.parametrize("shape", [(64, 64)])
-def test_accuracy_smooth_l1_loss_backward_out_large_diff(
-    shape, dtype, reduction, beta
-):
+def test_accuracy_smooth_l1_loss_backward_out_large_diff(shape, dtype, reduction, beta):
     grad_output = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     inp = torch.full(shape, 100.0, dtype=dtype, device=flag_gems.device)
     target = torch.zeros(shape, dtype=dtype, device=flag_gems.device)

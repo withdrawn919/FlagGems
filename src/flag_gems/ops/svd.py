@@ -1665,6 +1665,7 @@ def _svd_empty_result(input, some=True, compute_uv=True):
 def _svd_triton_reduced(A):
     b, m, n = _svd_dims(A)
     k = min(m, n)
+    max_dim = max(m, n)
 
     if k == 1:
         return _svd_rank1(A)
@@ -1672,8 +1673,11 @@ def _svd_triton_reduced(A):
     if m == 2 and n == 2:
         return _svd_2x2(A, compute_uv=True)
 
-    if k == 2 and max(m, n) <= 4096:
+    if k == 2 and max_dim <= 4096:
         return _svd_rank2(A)
+
+    if k >= 16 and max_dim >= 4 * k:
+        return _svd_gram_jacobi(A, max_sweeps=2)
 
     if _can_use_small_jacobi(A):
         return _svd_small_jacobi(A)

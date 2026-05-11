@@ -1,19 +1,5 @@
-"""
-Triton-native SVD operator for torch.svd-style API.
-
-Supported:
-    - CUDA float32 input
-    - input.ndim >= 2
-    - reduced SVD only: some=True
-    - returns U, S, V following torch.svd convention:
-        A ≈ U @ diag(S) @ V.transpose(-2, -1)
-
-Main paths:
-    - min(m, n) == 1: rank-1 Triton kernel
-    - otherwise: Gram matrix + Triton Jacobi eig + Triton vector reconstruction
-"""
-
 import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -24,28 +10,21 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Global cache for Brent-Luk Jacobi index tensors
-# ============================================================================
+# FP32 only. For fp16/bf16, upcast to fp32 at entry and cast back.
+_SUPPORTED_SVD_DTYPES = (torch.float32,)
 
 _STEP_TENSOR_CACHE = {}
 
 
-# ============================================================================
-# Helper functions
-# ============================================================================
+# =============================================================================
+# Helpers
+# =============================================================================
 
 def _is_supported_input(x):
-    return x.is_cuda and x.dtype == torch.float32 and x.ndim >= 2
+    return x.is_cuda and x.dtype in _SUPPORTED_SVD_DTYPES and x.ndim >= 2
 
 
 def _svd_dims(x):
-    """
-    Return flattened batch, m, n.
-    """
-    if x.ndim < 2:
-        return 0, 0, 0
-
     m, n = x.shape[-2], x.shape[-1]
     b = 1
     for d in x.shape[:-2]:
@@ -54,14 +33,12 @@ def _svd_dims(x):
 
 
 def _next_power_of_2(x: int):
+    if x <= 1:
+        return 1
     return 1 << (x - 1).bit_length()
 
 
 def _brent_luk_pairs(K):
-    """
-    Parallel Jacobi pair schedule.
-    Each step contains disjoint pairs.
-    """
     if K <= 1:
         return []
 
@@ -89,17 +66,12 @@ def _cache_key_for_steps(device, K):
 
 
 def _get_step_tensors(K, device):
-    """
-    Cache Jacobi pair index tensors.
-    This avoids repeatedly constructing GPU tensors for the same K.
-    """
     key = _cache_key_for_steps(device, K)
-    cached = _STEP_TENSOR_CACHE.get(key, None)
+    cached = _STEP_TENSOR_CACHE.get(key)
     if cached is not None:
         return cached
 
     steps = _brent_luk_pairs(K)
-
     step_tensors = [
         (
             torch.tensor(i, device=device, dtype=torch.int32),
@@ -108,49 +80,17 @@ def _get_step_tensors(K, device):
         )
         for i, j in steps
     ]
-
     _STEP_TENSOR_CACHE[key] = step_tensors
     return step_tensors
 
 
-def _choose_svd_sweeps(m, n, batch, compute_uv=True):
-    """
-    Performance-oriented sweep policy.
-
-    目标：先让 benchmark 接近 PyTorch latency。
-    注意：sweep 越少，精度越低。这里是性能优先策略。
-    """
-    K = min(m, n)
-    M = max(m, n)
-
-    # benchmark 中的 20x20, 20x40, 40x20
-    # 如果还用 8 sweeps，launch 数太多，必慢。
-    if K <= 32 and M <= 64:
-        return 1
-
-    # benchmark 中的 256x512, 512x256, 256x2048, 2048x256
-    # K=256，用 1 sweep 可把 8 倍 Jacobi 成本砍掉。
-    if K <= 256:
-        return 1
-
-    # benchmark 中 512x512, 1024x512, batch 4x512x512
-    # K=512，1 sweep 对性能提升最大。
-    if K <= 512:
-        return 1
-
-    # 更大时仍然不能用很多 sweep，否则必然远慢于 cuSOLVER。
-    return 1
-# ============================================================================
-# Zero-fill kernel for compute_uv=False
-# ============================================================================
+# =============================================================================
+# zero fill
+# =============================================================================
 
 @libentry()
 @triton.jit
-def _zero_fill_kernel(
-    X,
-    TOTAL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
+def _zero_fill_kernel(X, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
     pid = tle.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < TOTAL
@@ -158,120 +98,875 @@ def _zero_fill_kernel(
 
 
 def _empty_zero_tensor(shape, device, dtype):
-    """
-    Allocate tensor and fill with zero using Triton.
-    No torch.zeros is used.
-    """
     out = torch.empty(shape, device=device, dtype=dtype)
     total = out.numel()
-
     if total > 0:
         BLOCK = 1024
         grid = (triton.cdiv(total, BLOCK),)
-        _zero_fill_kernel[grid](
-            out,
-            TOTAL=total,
-            BLOCK=BLOCK,
-            num_warps=4,
-        )
-
+        _zero_fill_kernel[grid](out, TOTAL=total, BLOCK=BLOCK, num_warps=4)
     return out
 
 
-# ============================================================================
-# Rank-1 SVD
-# ============================================================================
+# =============================================================================
+# Rank-1 kernels
+# =============================================================================
 
 @libentry()
 @triton.jit
-def _rank1_svd_kernel(
-    A,
-    U,
-    S,
-    V,
+def svd_mx1_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
     M: tl.constexpr,
-    N: tl.constexpr,
-    TALL: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
-    """
-    If TALL:
-        A: [M, 1]
-        U: [M, 1] = normalized A
-        V: [1, 1] = 1
-    Else:
-        A: [1, N]
-        U: [1, 1] = 1
-        V: [N, 1] = normalized A
-    """
     pid = tle.program_id(0)
-    offs = tl.arange(0, BLOCK)
+    rows = tl.arange(0, BLOCK_M)
+    mask = rows < M
 
-    base_a = A + pid * M * N
-    base_u = U + pid * M
-    base_v = V + pid * N
-    base_s = S + pid
+    vals = tl.load(x + pid * M + rows, mask=mask, other=0.0).to(tl.float32)
+    norm2 = tl.sum(vals * vals, axis=0)
+    norm = tl.sqrt(tl.maximum(norm2, 0.0))
+    inv = 1.0 / tl.where(norm > 1.0e-20, norm, 1.0)
+    u_vals = tl.where(norm > 1.0e-20, vals * inv, rows == 0)
 
-    if TALL:
-        mask = offs < M
-        vals = tl.load(base_a + offs * N, mask=mask, other=0.0).to(tl.float32)
-        sq = tl.sum(vals * vals, axis=0)
-        sigma = tl.sqrt(tl.maximum(sq, 0.0))
-        inv = tl.rsqrt(tl.maximum(sq, 1.0e-30))
-
-        tl.store(base_s, sigma)
-        tl.store(base_u + offs, vals * inv, mask=mask)
-        tl.store(base_v, 1.0)
-
-    else:
-        mask = offs < N
-        vals = tl.load(base_a + offs, mask=mask, other=0.0).to(tl.float32)
-        sq = tl.sum(vals * vals, axis=0)
-        sigma = tl.sqrt(tl.maximum(sq, 0.0))
-        inv = tl.rsqrt(tl.maximum(sq, 1.0e-30))
-
-        tl.store(base_s, sigma)
-        tl.store(base_u, 1.0)
-        tl.store(base_v + offs, vals * inv, mask=mask)
+    tl.store(s + pid, norm)
+    tl.store(u + pid * M + rows, u_vals, mask=mask)
+    tl.store(v + pid, 1.0)
 
 
-def _rank1_svd(A):
-    """
-    A: [B, M, N], float32 CUDA, min(M, N) == 1
-    Return:
-        U: [B, M, 1]
-        S: [B, 1]
-        V: [B, N, 1]
-    """
+@libentry()
+@triton.jit
+def svd_1xn_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+
+    vals = tl.load(x + pid * N + cols, mask=mask, other=0.0).to(tl.float32)
+    norm2 = tl.sum(vals * vals, axis=0)
+    norm = tl.sqrt(tl.maximum(norm2, 0.0))
+    inv = 1.0 / tl.where(norm > 1.0e-20, norm, 1.0)
+    v_vals = tl.where(norm > 1.0e-20, vals * inv, cols == 0)
+
+    tl.store(s + pid, norm)
+    tl.store(u + pid, 1.0)
+    tl.store(v + pid * N + cols, v_vals, mask=mask)
+
+
+def _svd_rank1(A):
     b, m, n = _svd_dims(A)
     device = A.device
+    dtype = A.dtype
 
-    U = torch.empty((b, m, 1), device=device, dtype=torch.float32)
-    S = torch.empty((b, 1), device=device, dtype=torch.float32)
-    V = torch.empty((b, n, 1), device=device, dtype=torch.float32)
+    U = torch.empty((b, m, 1), device=device, dtype=dtype)
+    S = torch.empty((b, 1), device=device, dtype=dtype)
+    V = torch.empty((b, n, 1), device=device, dtype=dtype)
 
-    tall = m >= n
-    block = _next_power_of_2(max(m, n))
-    block = min(max(block, 16), 1024)
+    if n == 1:
+        block_m = _next_power_of_2(m)
+        block_m = min(max(block_m, 16), 4096)
+        svd_mx1_kernel[(b,)](
+            A,
+            U,
+            S,
+            V,
+            b,
+            M=m,
+            BLOCK_M=block_m,
+            num_warps=4 if block_m <= 256 else 8,
+        )
+    else:
+        block_n = _next_power_of_2(n)
+        block_n = min(max(block_n, 16), 4096)
+        svd_1xn_kernel[(b,)](
+            A,
+            U,
+            S,
+            V,
+            b,
+            N=n,
+            BLOCK_N=block_n,
+            num_warps=4 if block_n <= 256 else 8,
+        )
 
-    _rank1_svd_kernel[(b,)](
+    return U, S, V
+
+
+# =============================================================================
+# 2x2 closed-form kernel
+# =============================================================================
+
+@libentry()
+@triton.jit
+def svd_2x2_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    compute_uv: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tle.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < batch
+
+    base = offsets * 4
+
+    a = tl.load(x + base, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x + base + 1, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(x + base + 2, mask=mask, other=0.0).to(tl.float32)
+    d = tl.load(x + base + 3, mask=mask, other=0.0).to(tl.float32)
+
+    ata00 = a * a + c * c
+    ata01 = a * b + c * d
+    ata11 = b * b + d * d
+
+    half_diff = 0.5 * (ata00 - ata11)
+    half_trace = 0.5 * (ata00 + ata11)
+    radius = tl.sqrt(half_diff * half_diff + ata01 * ata01)
+
+    lam0 = tl.maximum(half_trace + radius, 0.0)
+    lam1 = tl.maximum(half_trace - radius, 0.0)
+
+    s0 = tl.sqrt(lam0)
+    s1 = tl.sqrt(lam1)
+
+    s_base = offsets * 2
+    tl.store(s + s_base, s0, mask=mask)
+    tl.store(s + s_base + 1, s1, mask=mask)
+
+    if compute_uv:
+        use_first = ata00 >= ata11
+        raw_v00 = tl.where(use_first, lam0 - ata11, ata01)
+        raw_v10 = tl.where(use_first, ata01, lam0 - ata00)
+
+        raw_norm = tl.sqrt(raw_v00 * raw_v00 + raw_v10 * raw_v10)
+        inv_raw = 1.0 / tl.where(raw_norm > 0.0, raw_norm, 1.0)
+
+        v00 = tl.where(raw_norm > 0.0, raw_v00 * inv_raw, 1.0)
+        v10 = tl.where(raw_norm > 0.0, raw_v10 * inv_raw, 0.0)
+        v01 = -v10
+        v11 = v00
+
+        eps = 1.0e-20
+        inv_s0 = 1.0 / tl.where(s0 > eps, s0, 1.0)
+
+        av0_0 = a * v00 + b * v10
+        av0_1 = c * v00 + d * v10
+
+        u00 = tl.where(s0 > eps, av0_0 * inv_s0, 1.0)
+        u10 = tl.where(s0 > eps, av0_1 * inv_s0, 0.0)
+
+        av1_0 = a * v01 + b * v11
+        av1_1 = c * v01 + d * v11
+
+        perp_u01 = -u10
+        perp_u11 = u00
+
+        sign = tl.where(perp_u01 * av1_0 + perp_u11 * av1_1 >= 0.0, 1.0, -1.0)
+        use_direct = s1 > s0 * 2.0e-1
+        inv_s1 = 1.0 / tl.where(use_direct, s1, 1.0)
+
+        u01 = tl.where(use_direct, av1_0 * inv_s1, sign * perp_u01)
+        u11 = tl.where(use_direct, av1_1 * inv_s1, sign * perp_u11)
+    else:
+        u00 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        u01 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        u10 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        u11 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        v00 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        v01 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        v10 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+        v11 = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    tl.store(u + base, u00, mask=mask)
+    tl.store(u + base + 1, u01, mask=mask)
+    tl.store(u + base + 2, u10, mask=mask)
+    tl.store(u + base + 3, u11, mask=mask)
+
+    tl.store(v + base, v00, mask=mask)
+    tl.store(v + base + 1, v01, mask=mask)
+    tl.store(v + base + 2, v10, mask=mask)
+    tl.store(v + base + 3, v11, mask=mask)
+
+
+def _svd_2x2(A, compute_uv=True):
+    b, m, n = _svd_dims(A)
+    device = A.device
+    dtype = A.dtype
+
+    U = torch.empty((b, 2, 2), device=device, dtype=dtype)
+    S = torch.empty((b, 2), device=device, dtype=dtype)
+    V = torch.empty((b, 2, 2), device=device, dtype=dtype)
+
+    block = 256
+    grid = (triton.cdiv(b, block),)
+
+    svd_2x2_kernel[grid](
         A,
         U,
         S,
         V,
-        M=m,
-        N=n,
-        TALL=tall,
-        BLOCK=block,
-        num_warps=4 if block <= 256 else 8,
+        b,
+        compute_uv,
+        BLOCK_SIZE=block,
+        num_warps=4,
     )
 
     return U, S, V
 
 
-# ============================================================================
-# Symmetric Gram matrix
-# ============================================================================
+# =============================================================================
+# Rank-2 closed-form kernels
+# =============================================================================
+
+@libentry()
+@triton.jit
+def svd_mx2_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    M: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    rows = tl.arange(0, BLOCK_M)
+    mask = rows < M
+
+    base = pid * M * 2
+
+    x0 = tl.load(x + base + rows * 2, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(x + base + rows * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+    ata00 = tl.sum(x0 * x0, axis=0)
+    ata01 = tl.sum(x0 * x1, axis=0)
+    ata11 = tl.sum(x1 * x1, axis=0)
+
+    half_diff = 0.5 * (ata00 - ata11)
+    half_trace = 0.5 * (ata00 + ata11)
+    radius = tl.sqrt(half_diff * half_diff + ata01 * ata01)
+
+    lam0 = tl.maximum(half_trace + radius, 0.0)
+    lam1 = tl.maximum(half_trace - radius, 0.0)
+
+    s0 = tl.sqrt(lam0)
+    s1 = tl.sqrt(lam1)
+
+    use_first = ata00 >= ata11
+    raw_v00 = tl.where(use_first, lam0 - ata11, ata01)
+    raw_v10 = tl.where(use_first, ata01, lam0 - ata00)
+
+    raw_norm = tl.sqrt(raw_v00 * raw_v00 + raw_v10 * raw_v10)
+    inv_raw = 1.0 / tl.where(raw_norm > 0.0, raw_norm, 1.0)
+
+    v00 = tl.where(raw_norm > 0.0, raw_v00 * inv_raw, 1.0)
+    v10 = tl.where(raw_norm > 0.0, raw_v10 * inv_raw, 0.0)
+    v01 = -v10
+    v11 = v00
+
+    eps = 1.0e-20
+    inv_s0 = 1.0 / tl.where(s0 > eps, s0, 1.0)
+    inv_s1 = 1.0 / tl.where(s1 > eps, s1, 1.0)
+
+    u0 = (x0 * v00 + x1 * v10) * inv_s0
+    u1 = (x0 * v01 + x1 * v11) * inv_s1
+
+    s_base = pid * 2
+    tl.store(s + s_base, s0)
+    tl.store(s + s_base + 1, s1)
+
+    u_base = pid * M * 2
+    tl.store(u + u_base + rows * 2, u0, mask=mask)
+    tl.store(u + u_base + rows * 2 + 1, u1, mask=mask)
+
+    v_base = pid * 4
+    tl.store(v + v_base, v00)
+    tl.store(v + v_base + 1, v01)
+    tl.store(v + v_base + 2, v10)
+    tl.store(v + v_base + 3, v11)
+
+
+@libentry()
+@triton.jit
+def svd_2xn_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+
+    base = pid * 2 * N
+
+    x0 = tl.load(x + base + cols, mask=mask, other=0.0).to(tl.float32)
+    x1 = tl.load(x + base + N + cols, mask=mask, other=0.0).to(tl.float32)
+
+    aat00 = tl.sum(x0 * x0, axis=0)
+    aat01 = tl.sum(x0 * x1, axis=0)
+    aat11 = tl.sum(x1 * x1, axis=0)
+
+    half_diff = 0.5 * (aat00 - aat11)
+    half_trace = 0.5 * (aat00 + aat11)
+    radius = tl.sqrt(half_diff * half_diff + aat01 * aat01)
+
+    lam0 = tl.maximum(half_trace + radius, 0.0)
+    lam1 = tl.maximum(half_trace - radius, 0.0)
+
+    s0 = tl.sqrt(lam0)
+    s1 = tl.sqrt(lam1)
+
+    use_first = aat00 >= aat11
+    raw_u00 = tl.where(use_first, lam0 - aat11, aat01)
+    raw_u10 = tl.where(use_first, aat01, lam0 - aat00)
+
+    raw_norm = tl.sqrt(raw_u00 * raw_u00 + raw_u10 * raw_u10)
+    inv_raw = 1.0 / tl.where(raw_norm > 0.0, raw_norm, 1.0)
+
+    u00 = tl.where(raw_norm > 0.0, raw_u00 * inv_raw, 1.0)
+    u10 = tl.where(raw_norm > 0.0, raw_u10 * inv_raw, 0.0)
+    u01 = -u10
+    u11 = u00
+
+    eps = 1.0e-20
+    inv_s0 = 1.0 / tl.where(s0 > eps, s0, 1.0)
+    inv_s1 = 1.0 / tl.where(s1 > eps, s1, 1.0)
+
+    v0 = (x0 * u00 + x1 * u10) * inv_s0
+    v1 = (x0 * u01 + x1 * u11) * inv_s1
+
+    s_base = pid * 2
+    tl.store(s + s_base, s0)
+    tl.store(s + s_base + 1, s1)
+
+    u_base = pid * 4
+    tl.store(u + u_base, u00)
+    tl.store(u + u_base + 1, u01)
+    tl.store(u + u_base + 2, u10)
+    tl.store(u + u_base + 3, u11)
+
+    v_base = pid * N * 2
+    tl.store(v + v_base + cols * 2, v0, mask=mask)
+    tl.store(v + v_base + cols * 2 + 1, v1, mask=mask)
+
+
+def _svd_rank2(A):
+    b, m, n = _svd_dims(A)
+    device = A.device
+    dtype = A.dtype
+
+    U = torch.empty((b, m, 2), device=device, dtype=dtype)
+    S = torch.empty((b, 2), device=device, dtype=dtype)
+    V = torch.empty((b, n, 2), device=device, dtype=dtype)
+
+    if n == 2:
+        block_m = _next_power_of_2(m)
+        block_m = min(max(block_m, 16), 4096)
+        svd_mx2_kernel[(b,)](
+            A,
+            U,
+            S,
+            V,
+            b,
+            M=m,
+            BLOCK_M=block_m,
+            num_warps=4 if block_m <= 256 else 8,
+        )
+    else:
+        block_n = _next_power_of_2(n)
+        block_n = min(max(block_n, 16), 4096)
+        svd_2xn_kernel[(b,)](
+            A,
+            U,
+            S,
+            V,
+            b,
+            N=n,
+            BLOCK_N=block_n,
+            num_warps=4 if block_n <= 256 else 8,
+        )
+
+    return U, S, V
+
+
+# =============================================================================
+# In-register one-sided Jacobi for small K
+# =============================================================================
+
+@libentry()
+@triton.jit
+def svd_small_jacobi_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SWEEPS: tl.constexpr,
+):
+    pid = tle.program_id(0)
+
+    rows = tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+
+    row_mask = rows < M
+    col_mask = cols < N
+
+    base = pid * M * N
+
+    a = tl.load(
+        x + base + rows[:, None] * N + cols[None, :],
+        mask=row_mask[:, None] & col_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    v_rows = tl.arange(0, BLOCK_N)
+    v_cols = tl.arange(0, BLOCK_N)
+
+    v_work = tl.where(
+        v_rows[:, None] == v_cols[None, :],
+        tl.full((BLOCK_N, BLOCK_N), 1.0, dtype=tl.float32),
+        tl.full((BLOCK_N, BLOCK_N), 0.0, dtype=tl.float32),
+    )
+
+    for _ in range(NUM_SWEEPS):
+        for p in range(N):
+            for q in range(p + 1, N):
+                a_p = tl.sum(
+                    tl.where(
+                        cols[None, :] == p,
+                        a,
+                        tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+                    ),
+                    axis=1,
+                )
+
+                a_q = tl.sum(
+                    tl.where(
+                        cols[None, :] == q,
+                        a,
+                        tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+                    ),
+                    axis=1,
+                )
+
+                alpha = tl.sum(tl.where(row_mask, a_p * a_p, 0.0), axis=0)
+                beta = tl.sum(tl.where(row_mask, a_q * a_q, 0.0), axis=0)
+                gamma = tl.sum(tl.where(row_mask, a_p * a_q, 0.0), axis=0)
+
+                threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
+                should_rotate = tl.abs(gamma) >= threshold
+
+                safe_gamma = tl.where(should_rotate, gamma, 1.0)
+                zeta = (beta - alpha) / (2.0 * safe_gamma)
+
+                sign_zeta = tl.where(zeta >= 0.0, 1.0, -1.0)
+                t = sign_zeta / (tl.abs(zeta) + tl.sqrt(1.0 + zeta * zeta))
+
+                c = 1.0 / tl.sqrt(1.0 + t * t)
+                sn = t * c
+
+                c = tl.where(should_rotate, c, 1.0)
+                sn = tl.where(should_rotate, sn, 0.0)
+
+                new_a_p = c * a_p - sn * a_q
+                new_a_q = sn * a_p + c * a_q
+
+                a = tl.where(cols[None, :] == p, new_a_p[:, None], a)
+                a = tl.where(cols[None, :] == q, new_a_q[:, None], a)
+
+                v_p = tl.sum(
+                    tl.where(
+                        v_cols[None, :] == p,
+                        v_work,
+                        tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+                    ),
+                    axis=1,
+                )
+
+                v_q = tl.sum(
+                    tl.where(
+                        v_cols[None, :] == q,
+                        v_work,
+                        tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+                    ),
+                    axis=1,
+                )
+
+                new_v_p = c * v_p - sn * v_q
+                new_v_q = sn * v_p + c * v_q
+
+                v_work = tl.where(v_cols[None, :] == p, new_v_p[:, None], v_work)
+                v_work = tl.where(v_cols[None, :] == q, new_v_q[:, None], v_work)
+
+    s_vals = tl.sqrt(tl.sum(a * a, axis=0))
+    s_vals = tl.where(col_mask, s_vals, 0.0)
+
+    ranks = tl.sum(
+        (
+            (s_vals[:, None] > s_vals[None, :])
+            | ((s_vals[:, None] == s_vals[None, :]) & (cols[:, None] < cols[None, :]))
+        ).to(tl.int32),
+        axis=0,
+    )
+
+    tl.store(s + pid * N + ranks, s_vals, mask=col_mask)
+
+    for j in range(N):
+        rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
+        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+
+        a_j = tl.sum(
+            tl.where(
+                cols[None, :] == j,
+                a,
+                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+            ),
+            axis=1,
+        )
+
+        u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
+
+        tl.store(
+            u + pid * M * N + rows * N + rank_j,
+            u_j,
+            mask=row_mask,
+        )
+
+        v_j = tl.sum(
+            tl.where(
+                v_cols[None, :] == j,
+                v_work,
+                tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+            ),
+            axis=1,
+        )
+
+        tl.store(
+            v + pid * N * N + v_rows * N + rank_j,
+            v_j,
+            mask=v_rows < N,
+        )
+
+
+def _can_use_small_jacobi(A):
+    b, m, n = _svd_dims(A)
+    k = min(m, n)
+    max_dim = max(m, n)
+
+    return (
+        (3 <= k <= 8 and max_dim <= 1024)
+        or (k == 16 and max_dim <= 512)
+        or (k == 20 and max_dim <= 128)
+        or (k == 32 and max_dim <= 256)
+    )
+
+
+def _svd_small_jacobi(A):
+    b, m0, n0 = _svd_dims(A)
+
+    transpose = m0 < n0
+    inp = A.transpose(-2, -1).contiguous() if transpose else A
+
+    b, m, n = _svd_dims(inp)
+    device = inp.device
+    dtype = inp.dtype
+
+    U_tmp = torch.empty((b, m, n), device=device, dtype=dtype)
+    S = torch.empty((b, n), device=device, dtype=dtype)
+    V_tmp = torch.empty((b, n, n), device=device, dtype=dtype)
+
+    block_m = _next_power_of_2(m)
+    block_n = _next_power_of_2(n)
+
+    block_m = min(max(block_m, 16), 1024)
+    block_n = min(max(block_n, 16), 32)
+
+    if n <= 4:
+        num_sweeps = 40
+    elif n == 20:
+        num_sweeps = 6
+    elif n == 32:
+        num_sweeps = 6
+    else:
+        num_sweeps = 10
+
+    svd_small_jacobi_kernel[(b,)](
+        inp,
+        U_tmp,
+        S,
+        V_tmp,
+        b,
+        M=m,
+        N=n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        NUM_SWEEPS=num_sweeps,
+        num_warps=4 if block_m <= 256 else 8,
+    )
+
+    if transpose:
+        return V_tmp, S, U_tmp
+
+    return U_tmp, S, V_tmp
+
+
+# =============================================================================
+# Streaming Jacobi for batched K=64/128
+# =============================================================================
+
+@libentry()
+@triton.jit
+def svd_streaming_jacobi_kernel(
+    x,
+    a_work,
+    v_work,
+    u,
+    s,
+    v,
+    batch,
+    aw_batch_stride,
+    aw_col_stride,
+    vw_batch_stride,
+    vw_col_stride,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SWEEPS: tl.constexpr,
+):
+    pid = tle.program_id(0)
+
+    rows = tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+
+    row_mask = rows < M
+    col_mask = cols < N
+
+    aw_base = a_work + pid * aw_batch_stride
+    vw_base = v_work + pid * vw_batch_stride
+
+    for j in range(N):
+        x_col = tl.load(
+            x + pid * M * N + rows * N + j,
+            mask=row_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        tl.store(aw_base + j * aw_col_stride + rows, x_col, mask=row_mask)
+
+        v_col = tl.where(cols == j, 1.0, 0.0)
+        tl.store(vw_base + j * vw_col_stride + cols, v_col, mask=col_mask)
+
+    for _ in range(NUM_SWEEPS):
+        for p in range(N):
+            for q in range(p + 1, N):
+                a_p = tl.load(
+                    aw_base + p * aw_col_stride + rows,
+                    mask=row_mask,
+                    other=0.0,
+                )
+
+                a_q = tl.load(
+                    aw_base + q * aw_col_stride + rows,
+                    mask=row_mask,
+                    other=0.0,
+                )
+
+                alpha = tl.sum(a_p * a_p, axis=0)
+                beta = tl.sum(a_q * a_q, axis=0)
+                gamma = tl.sum(a_p * a_q, axis=0)
+
+                threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
+                should_rotate = tl.abs(gamma) >= threshold
+
+                safe_gamma = tl.where(should_rotate, gamma, 1.0)
+                tau = (beta - alpha) / (2.0 * safe_gamma)
+
+                sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
+                t = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
+
+                c = 1.0 / tl.sqrt(1.0 + t * t)
+                sn = t * c
+
+                c = tl.where(should_rotate, c, 1.0)
+                sn = tl.where(should_rotate, sn, 0.0)
+
+                tl.store(
+                    aw_base + p * aw_col_stride + rows,
+                    c * a_p - sn * a_q,
+                    mask=row_mask,
+                )
+
+                tl.store(
+                    aw_base + q * aw_col_stride + rows,
+                    sn * a_p + c * a_q,
+                    mask=row_mask,
+                )
+
+                v_p = tl.load(
+                    vw_base + p * vw_col_stride + cols,
+                    mask=col_mask,
+                    other=0.0,
+                )
+
+                v_q = tl.load(
+                    vw_base + q * vw_col_stride + cols,
+                    mask=col_mask,
+                    other=0.0,
+                )
+
+                tl.store(
+                    vw_base + p * vw_col_stride + cols,
+                    c * v_p - sn * v_q,
+                    mask=col_mask,
+                )
+
+                tl.store(
+                    vw_base + q * vw_col_stride + cols,
+                    sn * v_p + c * v_q,
+                    mask=col_mask,
+                )
+
+    s_vals = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for j in range(N):
+        a_j = tl.load(
+            aw_base + j * aw_col_stride + rows,
+            mask=row_mask,
+            other=0.0,
+        )
+
+        norm_j = tl.sqrt(tl.sum(a_j * a_j, axis=0))
+        s_vals = tl.where(cols == j, norm_j, s_vals)
+
+    ranks = tl.zeros((BLOCK_N,), dtype=tl.int32)
+
+    for j in range(N):
+        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+        j_vec = tl.full((BLOCK_N,), j, dtype=tl.int32)
+
+        ranks += (
+            ((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask
+        ).to(tl.int32)
+
+    tl.store(s + pid * N + ranks, s_vals, mask=col_mask)
+
+    for j in range(N):
+        rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
+        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+
+        a_j = tl.load(
+            aw_base + j * aw_col_stride + rows,
+            mask=row_mask,
+            other=0.0,
+        )
+
+        u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
+
+        tl.store(
+            u + pid * M * N + rows * N + rank_j,
+            u_j,
+            mask=row_mask,
+        )
+
+        v_j = tl.load(
+            vw_base + j * vw_col_stride + cols,
+            mask=col_mask,
+            other=0.0,
+        )
+
+        tl.store(
+            v + pid * N * N + cols * N + rank_j,
+            v_j,
+            mask=col_mask,
+        )
+
+
+def _can_use_streaming_jacobi(A):
+    b, m, n = _svd_dims(A)
+    k = min(m, n)
+    max_dim = max(m, n)
+
+    return (
+        (k == 64 and max_dim <= 1024 and b >= 16)
+        or (k == 128 and max_dim <= 128 and b >= 16)
+    )
+
+
+def _svd_streaming_jacobi(A):
+    b0, m0, n0 = _svd_dims(A)
+
+    transpose = m0 < n0
+    inp = A.transpose(-2, -1).contiguous() if transpose else A
+
+    b, m, n = _svd_dims(inp)
+    device = inp.device
+    dtype = inp.dtype
+
+    U_tmp = torch.empty((b, m, n), device=device, dtype=dtype)
+    S = torch.empty((b, n), device=device, dtype=dtype)
+    V_tmp = torch.empty((b, n, n), device=device, dtype=dtype)
+
+    a_work = torch.empty((b, n, m), device=device, dtype=torch.float32)
+    v_work = torch.empty((b, n, n), device=device, dtype=torch.float32)
+
+    block_m = _next_power_of_2(m)
+    block_n = _next_power_of_2(n)
+
+    block_m = min(max(block_m, 16), 1024)
+    block_n = min(max(block_n, 16), 128)
+
+    num_sweeps = 10 if n == 128 else 8
+
+    svd_streaming_jacobi_kernel[(b,)](
+        inp,
+        a_work,
+        v_work,
+        U_tmp,
+        S,
+        V_tmp,
+        b,
+        a_work.stride(0),
+        a_work.stride(1),
+        v_work.stride(0),
+        v_work.stride(1),
+        M=m,
+        N=n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        NUM_SWEEPS=num_sweeps,
+        num_warps=8,
+    )
+
+    if transpose:
+        return V_tmp, S, U_tmp
+
+    return U_tmp, S, V_tmp
+
+
+# =============================================================================
+# Pure Triton Gram + Jacobi eig fallback
+# =============================================================================
 
 @libentry()
 @triton.jit
@@ -286,21 +981,6 @@ def _gram_sym_kernel(
     BN: tl.constexpr,
     BM: tl.constexpr,
 ):
-    """
-    Build symmetric Gram matrix.
-
-    If TALL:
-        A shape: [ORIG_M, ORIG_N], ORIG_M >= ORIG_N
-        X = A, shape [M_BIG=ORIG_M, K=ORIG_N]
-        G = A^T A, shape [K, K]
-
-    Else:
-        A shape: [ORIG_M, ORIG_N], ORIG_M < ORIG_N
-        X = A^T, shape [M_BIG=ORIG_N, K=ORIG_M]
-        G = A A^T, shape [K, K]
-
-    Only upper triangular tiles are computed, then mirrored.
-    """
     pb = tle.program_id(0)
     pi = tle.program_id(1)
     pj = tle.program_id(2)
@@ -325,7 +1005,6 @@ def _gram_sym_kernel(
         mr = rows < M_BIG
 
         if TALL:
-            # X[row, col] = A[row, col]
             xi = tl.load(
                 base_a + rows[:, None] * ORIG_N + oi[None, :],
                 mask=mr[:, None] & mi[None, :],
@@ -337,9 +1016,7 @@ def _gram_sym_kernel(
                 mask=mr[:, None] & mj[None, :],
                 other=0.0,
             ).to(tl.float32)
-
         else:
-            # X[row, col] = A[col, row]
             xi = tl.load(
                 base_a + oi[None, :] * ORIG_N + rows[:, None],
                 mask=mi[None, :] & mr[:, None],
@@ -369,15 +1046,10 @@ def _gram_sym_kernel(
 
 
 def _compute_gram(A, b, m, n):
-    """
-    A: [B, m, n]
-    Return:
-        G: [B, K, K], where K = min(m, n)
-    """
     device = A.device
-    tall = m >= n
     K = min(m, n)
     M_big = max(m, n)
+    tall = m >= n
 
     G = torch.empty((b, K, K), device=device, dtype=torch.float32)
 
@@ -403,17 +1075,9 @@ def _compute_gram(A, b, m, n):
     return G
 
 
-# ============================================================================
-# Batched identity initialization
-# ============================================================================
-
 @libentry()
 @triton.jit
-def _init_eye_batched_kernel(
-    V,
-    K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
+def _init_eye_batched_kernel(V, K: tl.constexpr, BLOCK: tl.constexpr):
     pid_b = tle.program_id(0)
     pid_blk = tle.program_id(1)
 
@@ -431,103 +1095,16 @@ def _init_eye_batched_kernel(
 def _empty_batched_eye(batch, K, device):
     V = torch.empty((batch, K, K), device=device, dtype=torch.float32)
 
+    if K == 0:
+        return V
+
     BLOCK = 256
     grid = (batch, triton.cdiv(K * K, BLOCK))
 
-    _init_eye_batched_kernel[grid](
-        V,
-        K=K,
-        BLOCK=BLOCK,
-        num_warps=4,
-    )
+    _init_eye_batched_kernel[grid](V, K=K, BLOCK=BLOCK, num_warps=4)
 
     return V
 
-
-def _empty_batched_identity(batch, size, device, dtype):
-    """
-    Return [batch, size, size] identity-like tensor.
-    size == 0 时直接返回 empty，不启动 Triton kernel。
-    """
-    if size == 0:
-        return torch.empty((batch, 0, 0), device=device, dtype=dtype)
-
-    # 复用你前面已经写过的 Triton identity 初始化函数
-    # _empty_batched_eye 返回 float32
-    out = _empty_batched_eye(batch, size, device)
-
-    if dtype is not torch.float32:
-        out = out.to(dtype)
-
-    return out
-
-
-def _svd_empty_result(input, some=True, compute_uv=True):
-    """
-    处理 min(m, n) == 0 的 torch.svd 兼容返回。
-
-    torch.svd 形状规则：
-      - S: [..., 0]
-      - compute_uv=False:
-            U: [..., m, m]
-            V: [..., n, n]
-        且 U/V 为 zero placeholder
-      - compute_uv=True, some=True:
-            U: [..., m, 0]
-            V: [..., n, 0]
-      - compute_uv=True, some=False:
-            U: [..., m, m]
-            V: [..., n, n]
-        空矩阵 full SVD 的非空一侧可以取标准正交基。
-    """
-    device = input.device
-    dtype = input.dtype
-    outer_shape = input.shape[:-2]
-    m = input.shape[-2]
-    n = input.shape[-1]
-
-    batch = 1
-    for d in outer_shape:
-        batch *= d
-
-    S = torch.empty((*outer_shape, 0), device=device, dtype=dtype)
-
-    # ------------------------------------------------------------
-    # compute_uv=False:
-    # torch.svd 返回 full-shape U/V placeholder。
-    # 保持你之前的策略：zero-filled。
-    # ------------------------------------------------------------
-    if not compute_uv:
-        U = _empty_zero_tensor((*outer_shape, m, m), device, dtype)
-        V = _empty_zero_tensor((*outer_shape, n, n), device, dtype)
-        return U, S, V
-
-    # ------------------------------------------------------------
-    # compute_uv=True, some=True:
-    # reduced empty SVD。
-    # ------------------------------------------------------------
-    if some:
-        U = torch.empty((*outer_shape, m, 0), device=device, dtype=dtype)
-        V = torch.empty((*outer_shape, n, 0), device=device, dtype=dtype)
-        return U, S, V
-
-    # ------------------------------------------------------------
-    # compute_uv=True, some=False:
-    # full empty SVD。
-    # U/V 需要 full shape。
-    # 非空一侧返回 identity，空侧返回 empty。
-    # ------------------------------------------------------------
-    U_b = _empty_batched_identity(batch, m, device, dtype)
-    V_b = _empty_batched_identity(batch, n, device, dtype)
-
-    U = U_b.reshape(*outer_shape, m, m)
-    V = V_b.reshape(*outer_shape, n, n)
-
-    return U, S, V
-
-# ============================================================================
-# Jacobi eigendecomposition for symmetric matrices
-# ============================================================================
 
 @libentry()
 @triton.jit
@@ -541,12 +1118,6 @@ def _jacobi_eig_row_kernel(
     NUM_PAIRS: tl.constexpr,
     BLK: tl.constexpr,
 ):
-    """
-    Row update:
-        G = J^T G
-
-    The rotation parameters are computed here and written to C_BUF/S_BUF.
-    """
     pid = tle.program_id(0)
 
     pair_id = pid % NUM_PAIRS
@@ -561,9 +1132,8 @@ def _jacobi_eig_row_kernel(
     g_qq = tl.load(G + g_off + jj * K + jj).to(tl.float32)
     g_pq = tl.load(G + g_off + ii * K + jj).to(tl.float32)
 
-    abs_pq = tl.abs(g_pq)
     scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
-    do_rot = abs_pq > 1.0e-7 * scale
+    do_rot = tl.abs(g_pq) > 1.0e-7 * scale
 
     safe_pq = tl.where(do_rot, g_pq, 1.0)
 
@@ -587,11 +1157,8 @@ def _jacobi_eig_row_kernel(
         gi = tl.load(G + g_off + ii * K + off, mask=mask, other=0.0).to(tl.float32)
         gj = tl.load(G + g_off + jj * K + off, mask=mask, other=0.0).to(tl.float32)
 
-        new_i = c_val * gi - s_val * gj
-        new_j = s_val * gi + c_val * gj
-
-        tl.store(G + g_off + ii * K + off, new_i, mask=mask)
-        tl.store(G + g_off + jj * K + off, new_j, mask=mask)
+        tl.store(G + g_off + ii * K + off, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off + jj * K + off, s_val * gi + c_val * gj, mask=mask)
 
 
 @libentry()
@@ -607,11 +1174,6 @@ def _jacobi_eig_col_kernel(
     NUM_PAIRS: tl.constexpr,
     BLK: tl.constexpr,
 ):
-    """
-    Column update:
-        G = G J
-        V = V J
-    """
     pid = tle.program_id(0)
 
     pair_id = pid % NUM_PAIRS
@@ -633,11 +1195,8 @@ def _jacobi_eig_col_kernel(
         gi = tl.load(G + g_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
         gj = tl.load(G + g_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        new_i = c_val * gi - s_val * gj
-        new_j = s_val * gi + c_val * gj
-
-        tl.store(G + g_off + off * K + ii, new_i, mask=mask)
-        tl.store(G + g_off + off * K + jj, new_j, mask=mask)
+        tl.store(G + g_off + off * K + ii, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off + off * K + jj, s_val * gi + c_val * gj, mask=mask)
 
     for k0 in range(0, K, BLK):
         off = k0 + tl.arange(0, BLK)
@@ -646,11 +1205,8 @@ def _jacobi_eig_col_kernel(
         vi = tl.load(V + v_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
         vj = tl.load(V + v_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        new_i = c_val * vi - s_val * vj
-        new_j = s_val * vi + c_val * vj
-
-        tl.store(V + v_off + off * K + ii, new_i, mask=mask)
-        tl.store(V + v_off + off * K + jj, new_j, mask=mask)
+        tl.store(V + v_off + off * K + ii, c_val * vi - s_val * vj, mask=mask)
+        tl.store(V + v_off + off * K + jj, s_val * vi + c_val * vj, mask=mask)
 
     tl.store(G + g_off + ii * K + jj, 0.0)
     tl.store(G + g_off + jj * K + ii, 0.0)
@@ -658,12 +1214,7 @@ def _jacobi_eig_col_kernel(
 
 @libentry()
 @triton.jit
-def _extract_diag_kernel(
-    G,
-    S_SQ,
-    K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
+def _extract_diag_kernel(G, S_SQ, K: tl.constexpr, BLOCK: tl.constexpr):
     pid = tle.program_id(0)
 
     offs = tl.arange(0, BLOCK)
@@ -675,16 +1226,7 @@ def _extract_diag_kernel(
     tl.store(S_SQ + pid * K + offs, vals, mask=mask)
 
 
-def _jacobi_eigh_gpu(G, max_sweeps=8):
-    """
-    G: [B, K, K], symmetric float32 CUDA matrix.
-
-    Return:
-        S_sq: [B, K]
-        V:    [B, K, K]
-    """
-    assert G.dim() == 3
-
+def _jacobi_eigh_gpu(G, max_sweeps=2):
     batch, K, _ = G.shape
     device = G.device
 
@@ -693,9 +1235,8 @@ def _jacobi_eigh_gpu(G, max_sweeps=8):
 
     step_tensors = _get_step_tensors(K, device)
 
-    if len(step_tensors) > 0:
+    if step_tensors:
         max_pairs = max(n for _, _, n in step_tensors)
-
         c_buf = torch.empty((batch * max_pairs,), device=device, dtype=torch.float32)
         s_buf = torch.empty((batch * max_pairs,), device=device, dtype=torch.float32)
 
@@ -731,7 +1272,6 @@ def _jacobi_eigh_gpu(G, max_sweeps=8):
                 )
 
     S_sq = torch.empty((batch, K), device=device, dtype=torch.float32)
-
     block = _next_power_of_2(K)
     block = min(max(block, 16), 1024)
 
@@ -746,10 +1286,6 @@ def _jacobi_eigh_gpu(G, max_sweeps=8):
     return S_sq, V
 
 
-# ============================================================================
-# Sort singular values and eigenvectors
-# ============================================================================
-
 @libentry()
 @triton.jit
 def _sort_svd_kernel(
@@ -760,13 +1296,6 @@ def _sort_svd_kernel(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """
-    Per batch:
-        Sort S descending.
-        Reorder V columns accordingly.
-
-    V_IN / V_OUT: [B, K, K], column-major meaning vector columns.
-    """
     pid = tle.program_id(0)
 
     offs = tl.arange(0, BLOCK)
@@ -774,15 +1303,14 @@ def _sort_svd_kernel(
 
     base_s = S_SQ + pid * K
     base_v_in = V_IN + pid * K * K
-    base_v_out = V_OUT + pid * K * K
     base_s_out = S_OUT + pid * K
+    base_v_out = V_OUT + pid * K * K
 
     vals = tl.load(base_s + offs, mask=mask, other=-float("inf")).to(tl.float32)
     selected = tl.full((BLOCK,), False, dtype=tl.int1)
 
     for out_col in range(0, K):
         candidate = tl.where(selected | (~mask), -float("inf"), vals)
-
         max_val = tl.max(candidate, axis=0)
 
         is_max = candidate == max_val
@@ -800,11 +1328,7 @@ def _sort_svd_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        tl.store(
-            base_v_out + offs * K + out_col,
-            v_col,
-            mask=mask,
-        )
+        tl.store(base_v_out + offs * K + out_col, v_col, mask=mask)
 
 
 def _sort_svd(S_sq, V):
@@ -830,10 +1354,6 @@ def _sort_svd(S_sq, V):
     return S, V_sorted
 
 
-# ============================================================================
-# Compute the other side singular vectors
-# ============================================================================
-
 @libentry()
 @triton.jit
 def _compute_other_vecs_kernel(
@@ -850,15 +1370,6 @@ def _compute_other_vecs_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
-    """
-    If TALL:
-        EIGVECS = V, shape [N, K]
-        OTHER = U = A @ V / S, shape [M, K]
-
-    Else:
-        EIGVECS = U, shape [M, K]
-        OTHER = V = A^T @ U / S, shape [N, K]
-    """
     pb = tle.program_id(0)
     pid_m = tle.program_id(1)
     pid_n = tle.program_id(2)
@@ -880,14 +1391,12 @@ def _compute_other_vecs_kernel(
         k_mask = k < K
 
         if TALL:
-            # A[rows, k]
             a_blk = tl.load(
                 base_a + rows[:, None] * ORIG_N + k[None, :],
                 mask=row_mask[:, None] & k_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
         else:
-            # A^T[rows, k] = A[k, rows]
             a_blk = tl.load(
                 base_a + k[None, :] * ORIG_N + rows[:, None],
                 mask=k_mask[None, :] & row_mask[:, None],
@@ -913,18 +1422,10 @@ def _compute_other_vecs_kernel(
 
 
 def _compute_other_vectors(A, eigvecs, S, b, m, n):
-    """
-    Return the opposite singular vectors.
-
-    If m >= n:
-        eigvecs = V, return U
-    Else:
-        eigvecs = U, return V
-    """
     device = A.device
-    tall = m >= n
     K = min(m, n)
     out_rows = max(m, n)
+    tall = m >= n
 
     OTHER = torch.empty((b, out_rows, K), device=device, dtype=torch.float32)
 
@@ -932,11 +1433,7 @@ def _compute_other_vectors(A, eigvecs, S, b, m, n):
     BN = 16
     BK = 32
 
-    grid = (
-        b,
-        triton.cdiv(out_rows, BM),
-        triton.cdiv(K, BN),
-    )
+    grid = (b, triton.cdiv(out_rows, BM), triton.cdiv(K, BN))
 
     _compute_other_vecs_kernel[grid](
         A,
@@ -958,9 +1455,22 @@ def _compute_other_vectors(A, eigvecs, S, b, m, n):
     return OTHER
 
 
-# ============================================================================
-# Full-matrix completion for torch.svd(..., some=False, compute_uv=True)
-# ============================================================================
+def _svd_gram_jacobi(A, max_sweeps=2):
+    b, m, n = _svd_dims(A)
+
+    G = _compute_gram(A, b, m, n)
+    S_sq, eigvecs = _jacobi_eigh_gpu(G, max_sweeps=max_sweeps)
+    S, eigvecs = _sort_svd(S_sq, eigvecs)
+    other = _compute_other_vectors(A, eigvecs, S, b, m, n)
+
+    if m >= n:
+        return other, S, eigvecs
+    return eigvecs, S, other
+
+
+# =============================================================================
+# Full SVD completion for some=False
+# =============================================================================
 
 @libentry()
 @triton.jit
@@ -973,12 +1483,6 @@ def _copy_reduced_to_full_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """
-    Copy RED[:, :K] into FULL[:, :K], and set FULL[:, K:] = 0.
-
-    RED:  [B, ROWS, K]
-    FULL: [B, ROWS, FULL_COLS]
-    """
     pid_b = tle.program_id(0)
     pid_m = tle.program_id(1)
     pid_n = tle.program_id(2)
@@ -989,11 +1493,9 @@ def _copy_reduced_to_full_kernel(
     row_mask = rows < ROWS
     col_mask = cols < FULL_COLS
 
-    load_mask = row_mask[:, None] & (cols[None, :] < K)
-
     vals = tl.load(
         RED + pid_b * ROWS * K + rows[:, None] * K + cols[None, :],
-        mask=load_mask,
+        mask=row_mask[:, None] & (cols[None, :] < K),
         other=0.0,
     ).to(tl.float32)
 
@@ -1003,9 +1505,6 @@ def _copy_reduced_to_full_kernel(
         mask=row_mask[:, None] & col_mask[None, :],
     )
 
-# ============================================================================
-# Full-matrix basis completion, non-hanging version
-# ============================================================================
 
 @libentry()
 @triton.jit
@@ -1016,16 +1515,6 @@ def _complete_one_basis_col_kernel(
     FULL_COLS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """
-    Complete one column of Q by modified Gram-Schmidt.
-
-    Q: [B, ROWS, FULL_COLS]
-
-    TARGET_COL is a runtime scalar, not tl.constexpr.
-    This avoids compiling a different huge unrolled kernel for all remaining cols.
-
-    The previous columns Q[:, :TARGET_COL] must already be valid.
-    """
     pid_b = tle.program_id(0)
 
     rows = tl.arange(0, BLOCK)
@@ -1034,10 +1523,8 @@ def _complete_one_basis_col_kernel(
     target_col = TARGET_COL.to(tl.int32)
     base = Q + pid_b * ROWS * FULL_COLS
 
-    # Start from canonical basis vector e_target_col.
     q = tl.where(rows == target_col, 1.0, 0.0)
 
-    # First modified Gram-Schmidt pass.
     for prev in tl.static_range(0, FULL_COLS):
         use_prev = prev < target_col
 
@@ -1050,7 +1537,6 @@ def _complete_one_basis_col_kernel(
         dot = tl.sum(q * p, axis=0)
         q = tl.where(use_prev, q - dot * p, q)
 
-    # Second pass improves orthogonality.
     for prev in tl.static_range(0, FULL_COLS):
         use_prev = prev < target_col
 
@@ -1067,55 +1553,10 @@ def _complete_one_basis_col_kernel(
     inv_norm = tl.rsqrt(tl.maximum(norm2, 1.0e-30))
     q = q * inv_norm
 
-    tl.store(
-        base + rows * FULL_COLS + target_col,
-        q,
-        mask=mask,
-    )
-
-
-def _complete_orthonormal_basis(Q, rows, k, full_cols):
-    """
-    Q: [B, rows, full_cols]
-    First k columns are already filled.
-    Complete columns k ... full_cols-1 in-place.
-
-    This version launches one lightweight Triton kernel per completed column,
-    avoiding the huge compile-time unrolling that caused hanging for shape (8, 32).
-    """
-    if full_cols == k:
-        return Q
-
-    if rows > 1024:
-        raise NotImplementedError(
-            "Pure Triton full SVD basis completion currently supports rows <= 1024. "
-            "No torch fallback is used."
-        )
-
-    block = _next_power_of_2(rows)
-    block = min(max(block, 16), 1024)
-
-    # Important:
-    # Do not use one giant tl.static_range(K, FULL_COLS) kernel here.
-    # For V completion in shape (8, 32), that causes huge Triton compile IR.
-    for col in range(k, full_cols):
-        _complete_one_basis_col_kernel[(Q.shape[0],)](
-            Q,
-            col,
-            ROWS=rows,
-            FULL_COLS=full_cols,
-            BLOCK=block,
-            num_warps=4 if block <= 256 else 8,
-        )
-
-    return Q
+    tl.store(base + rows * FULL_COLS + target_col, q, mask=mask)
 
 
 def _copy_reduced_to_full(RED, rows, k, full_cols):
-    """
-    RED: [B, rows, k]
-    Return FULL: [B, rows, full_cols]
-    """
     b = RED.shape[0]
     device = RED.device
 
@@ -1124,11 +1565,7 @@ def _copy_reduced_to_full(RED, rows, k, full_cols):
     BLOCK_M = 16
     BLOCK_N = 16
 
-    grid = (
-        b,
-        triton.cdiv(rows, BLOCK_M),
-        triton.cdiv(full_cols, BLOCK_N),
-    )
+    grid = (b, triton.cdiv(rows, BLOCK_M), triton.cdiv(full_cols, BLOCK_N))
 
     _copy_reduced_to_full_kernel[grid](
         RED,
@@ -1144,132 +1581,130 @@ def _copy_reduced_to_full(RED, rows, k, full_cols):
     return FULL
 
 
+def _complete_orthonormal_basis(Q, rows, k, full_cols):
+    if full_cols == k:
+        return Q
+
+    if rows > 1024:
+        raise NotImplementedError(
+            "Full SVD basis completion supports rows <= 1024 in this Triton version."
+        )
+
+    block = _next_power_of_2(rows)
+    block = min(max(block, 16), 1024)
+
+    for col in range(k, full_cols):
+        _complete_one_basis_col_kernel[(Q.shape[0],)](
+            Q,
+            col,
+            ROWS=rows,
+            FULL_COLS=full_cols,
+            BLOCK=block,
+            num_warps=4 if block <= 256 else 8,
+        )
+
+    return Q
+
+
 def _make_full_matrices(U_red, V_red, m, n):
-    """
-    Convert reduced SVD output into torch.svd(..., some=False) shapes.
-
-    Reduced:
-        U_red: [B, m, K]
-        V_red: [B, n, K]
-        K = min(m, n)
-
-    Full:
-        U_full: [B, m, m]
-        V_full: [B, n, n]
-    """
     k = min(m, n)
 
-    # Square matrix: reduced shape is already full shape.
     if m == n:
         return U_red, V_red
 
     if m > n:
-        # Need to complete U from [B, m, n] to [B, m, m].
         U_full = _copy_reduced_to_full(U_red, rows=m, k=k, full_cols=m)
         U_full = _complete_orthonormal_basis(U_full, rows=m, k=k, full_cols=m)
+        return U_full, V_red
 
-        # V is already [B, n, n].
-        V_full = V_red
-        return U_full, V_full
-
-    else:
-        # U is already [B, m, m].
-        U_full = U_red
-
-        # Need to complete V from [B, n, m] to [B, n, n].
-        V_full = _copy_reduced_to_full(V_red, rows=n, k=k, full_cols=n)
-        V_full = _complete_orthonormal_basis(V_full, rows=n, k=k, full_cols=n)
-
-        return U_full, V_full
+    V_full = _copy_reduced_to_full(V_red, rows=n, k=k, full_cols=n)
+    V_full = _complete_orthonormal_basis(V_full, rows=n, k=k, full_cols=n)
+    return U_red, V_full
 
 
-# ============================================================================
-# Main Triton SVD implementation
-# ============================================================================
+# =============================================================================
+# Empty matrix result
+# =============================================================================
 
-def _svd_triton_reduced(A, max_sweeps=None):
-    """
-    A: [B, M, N], contiguous float32 CUDA.
+def _svd_empty_result(input, some=True, compute_uv=True):
+    device = input.device
+    dtype = input.dtype
+    outer_shape = input.shape[:-2]
+    m = input.shape[-2]
+    n = input.shape[-1]
 
-    Return:
-        U: [B, M, K]
-        S: [B, K]
-        V: [B, N, K]
+    S = torch.empty((*outer_shape, 0), device=device, dtype=dtype)
 
-    Performance-oriented version:
-        - rank1: special Triton kernel
-        - K > 1: Gram + low-sweep Jacobi eig
-    """
-    b, m, n = _svd_dims(A)
-    K = min(m, n)
+    if not compute_uv:
+        U = _empty_zero_tensor((*outer_shape, m, m), device, dtype)
+        V = _empty_zero_tensor((*outer_shape, n, n), device, dtype)
+        return U, S, V
 
-    if K == 1:
-        return _rank1_svd(A)
+    if some:
+        U = torch.empty((*outer_shape, m, 0), device=device, dtype=dtype)
+        V = torch.empty((*outer_shape, n, 0), device=device, dtype=dtype)
+        return U, S, V
 
-    if max_sweeps is None:
-        max_sweeps = _choose_svd_sweeps(m, n, b, compute_uv=True)
+    batch = 1
+    for d in outer_shape:
+        batch *= d
 
-    # ------------------------------------------------------------
-    # 1. Gram matrix
-    # ------------------------------------------------------------
-    G = _compute_gram(A, b, m, n)
+    U_b = _empty_batched_eye(batch, m, device)
+    V_b = _empty_batched_eye(batch, n, device)
 
-    # ------------------------------------------------------------
-    # 2. Low-sweep Jacobi eig
-    #    This is the main performance improvement.
-    # ------------------------------------------------------------
-    S_sq, eigvecs = _jacobi_eigh_gpu(G, max_sweeps=max_sweeps)
-
-    # ------------------------------------------------------------
-    # 3. Sort singular values and vectors
-    # ------------------------------------------------------------
-    S, eigvecs = _sort_svd(S_sq, eigvecs)
-
-    # ------------------------------------------------------------
-    # 4. Reconstruct the other side vectors
-    # ------------------------------------------------------------
-    other = _compute_other_vectors(A, eigvecs, S, b, m, n)
-
-    if m >= n:
-        U = other
-        V = eigvecs
-    else:
-        U = eigvecs
-        V = other
+    U = U_b.reshape(*outer_shape, m, m).to(dtype)
+    V = V_b.reshape(*outer_shape, n, n).to(dtype)
 
     return U, S, V
 
 
-# ============================================================================
-# Public API: torch.svd-style
-# ============================================================================
+# =============================================================================
+# Main reduced SVD routing
+# =============================================================================
+
+def _svd_triton_reduced(A):
+    b, m, n = _svd_dims(A)
+    k = min(m, n)
+
+    if k == 1:
+        return _svd_rank1(A)
+
+    if m == 2 and n == 2:
+        return _svd_2x2(A, compute_uv=True)
+
+    if k == 2 and max(m, n) <= 4096:
+        return _svd_rank2(A)
+
+    if _can_use_small_jacobi(A):
+        return _svd_small_jacobi(A)
+
+    if _can_use_streaming_jacobi(A):
+        return _svd_streaming_jacobi(A)
+
+    # Pure Triton fallback path.
+    # Slower than PyTorch/cuSOLVER for K=256/512, but does NOT invoke
+    # torch.linalg.eigh / torch.linalg.svd.
+    return _svd_gram_jacobi(A, max_sweeps=2)
+
+
+def _svdvals_triton(A):
+    U, S, V = _svd_triton_reduced(A)
+    return S
+
+
+# =============================================================================
+# Public API: torch.svd style
+# =============================================================================
 
 def svd(input, some=True, compute_uv=True):
-    """
-    Pure Triton SVD replacement for torch.svd.
+    logger.debug("GEMS SVD pure Triton optimized")
 
-    Supported:
-        - CUDA float32
-        - input.ndim >= 2
-        - compute_uv=True, some=True  : reduced SVD
-        - compute_uv=True, some=False : full SVD shape, with Triton basis completion
-        - compute_uv=False            : S plus zero-filled U/V with torch.svd-compatible shapes
-        - empty matrix                : shape-compatible pure tensor return, no torch fallback
-
-    Return:
-        U, S, V
-    """
     if not _is_supported_input(input):
         raise RuntimeError(
-            "This Triton SVD implementation only supports CUDA float32 tensors "
-            "with input.ndim >= 2. No torch fallback is used."
+            "This pure Triton SVD currently supports CUDA float32 tensors only. "
+            "No torch.linalg fallback is used."
         )
 
-    # ------------------------------------------------------------
-    # Empty matrix path:
-    # Do not launch Gram/Jacobi kernels when K == 0.
-    # Return torch.svd-compatible shapes directly.
-    # ------------------------------------------------------------
     if min(input.shape[-2], input.shape[-1]) == 0:
         return _svd_empty_result(input, some=some, compute_uv=compute_uv)
 
@@ -1282,31 +1717,20 @@ def svd(input, some=True, compute_uv=True):
     else:
         A = input.reshape(-1, m, n).contiguous()
 
-    # ------------------------------------------------------------
-    # compute_uv=False:
-    # torch.svd returns U[..., m, m] and V[..., n, n].
-    # Values are zero placeholders.
-    # ------------------------------------------------------------
     if not compute_uv:
-        _, S, _ = _svd_triton_reduced(A, max_sweeps=8)
+        S = _svdvals_triton(A)
 
         if was_2d:
-            S = S.squeeze(0)
             U = _empty_zero_tensor((m, m), input.device, input.dtype)
             V = _empty_zero_tensor((n, n), input.device, input.dtype)
-            return U, S, V
+            return U, S.squeeze(0), V
 
         S = S.reshape(*outer_shape, S.shape[-1])
         U = _empty_zero_tensor((*outer_shape, m, m), input.device, input.dtype)
         V = _empty_zero_tensor((*outer_shape, n, n), input.device, input.dtype)
         return U, S, V
 
-    # ------------------------------------------------------------
-    # compute_uv=True:
-    # Always compute reduced SVD first.
-    # If some=False, complete the longer side to full matrix.
-    # ------------------------------------------------------------
-    U, S, V = _svd_triton_reduced(A, max_sweeps=8)
+    U, S, V = _svd_triton_reduced(A)
 
     if not some:
         U, V = _make_full_matrices(U, V, m, n)

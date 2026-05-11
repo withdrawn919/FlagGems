@@ -1056,6 +1056,11 @@ def _compute_gram(A, b, m, n):
     BN = 32
     BM = 64
 
+    if b <= 4 and K >= 128 and M_big >= 512:
+        BM = 128
+    else:
+        BM = 64
+        
     grid = (b, triton.cdiv(K, BN), triton.cdiv(K, BN))
 
     _gram_sym_kernel[grid](
@@ -1214,6 +1219,130 @@ def _jacobi_eig_col_kernel(
 
 @libentry()
 @triton.jit
+def _jacobi_eig_rowcol_fused_kernel(
+    G,
+    V,
+    K: tl.constexpr,
+    i_idx,
+    j_idx,
+    NUM_PAIRS: tl.constexpr,
+    BLK: tl.constexpr,
+):
+    pid = tle.program_id(0)
+
+    pair_id = pid % NUM_PAIRS
+    batch_id = pid // NUM_PAIRS
+
+    ii = tl.load(i_idx + pair_id).to(tl.int32)
+    jj = tl.load(j_idx + pair_id).to(tl.int32)
+
+    g_off = batch_id * K * K
+    v_off = batch_id * K * K
+
+    g_pp = tl.load(G + g_off + ii * K + ii).to(tl.float32)
+    g_qq = tl.load(G + g_off + jj * K + jj).to(tl.float32)
+    g_pq = tl.load(G + g_off + ii * K + jj).to(tl.float32)
+
+    scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
+    do_rot = tl.abs(g_pq) > 1.0e-7 * scale
+
+    safe_pq = tl.where(do_rot, g_pq, 1.0)
+
+    tau = (g_qq - g_pp) / (2.0 * safe_pq)
+    sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
+    t_val = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
+
+    c_val = tl.rsqrt(1.0 + t_val * t_val)
+    s_val = t_val * c_val
+
+    c_val = tl.where(do_rot, c_val, 1.0)
+    s_val = tl.where(do_rot, s_val, 0.0)
+
+    # ------------------------------------------------------------
+    # 1. row update:
+    #    [row_i, row_j] <- J^T [row_i, row_j]
+    # ------------------------------------------------------------
+    for k0 in range(0, K, BLK):
+        off = k0 + tl.arange(0, BLK)
+        mask = off < K
+
+        gi = tl.load(
+            G + g_off + ii * K + off,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        gj = tl.load(
+            G + g_off + jj * K + off,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        new_gi = c_val * gi - s_val * gj
+        new_gj = s_val * gi + c_val * gj
+
+        tl.store(G + g_off + ii * K + off, new_gi, mask=mask)
+        tl.store(G + g_off + jj * K + off, new_gj, mask=mask)
+
+    # ------------------------------------------------------------
+    # 2. col update:
+    #    [col_i, col_j] <- [col_i, col_j] J
+    # ------------------------------------------------------------
+    for k0 in range(0, K, BLK):
+        off = k0 + tl.arange(0, BLK)
+        mask = off < K
+
+        gi = tl.load(
+            G + g_off + off * K + ii,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        gj = tl.load(
+            G + g_off + off * K + jj,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        new_gi = c_val * gi - s_val * gj
+        new_gj = s_val * gi + c_val * gj
+
+        tl.store(G + g_off + off * K + ii, new_gi, mask=mask)
+        tl.store(G + g_off + off * K + jj, new_gj, mask=mask)
+
+    # ------------------------------------------------------------
+    # 3. eigenvector update:
+    #    V[:, i], V[:, j] <- V[:, i], V[:, j] J
+    # ------------------------------------------------------------
+    for k0 in range(0, K, BLK):
+        off = k0 + tl.arange(0, BLK)
+        mask = off < K
+
+        vi = tl.load(
+            V + v_off + off * K + ii,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        vj = tl.load(
+            V + v_off + off * K + jj,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        new_vi = c_val * vi - s_val * vj
+        new_vj = s_val * vi + c_val * vj
+
+        tl.store(V + v_off + off * K + ii, new_vi, mask=mask)
+        tl.store(V + v_off + off * K + jj, new_vj, mask=mask)
+
+    # 显式清零非对角项，减少后续误差传播
+    tl.store(G + g_off + ii * K + jj, 0.0)
+    tl.store(G + g_off + jj * K + ii, 0.0)
+
+
+@libentry()
+@triton.jit
 def _extract_diag_kernel(G, S_SQ, K: tl.constexpr, BLOCK: tl.constexpr):
     pid = tle.program_id(0)
 
@@ -1230,48 +1359,46 @@ def _jacobi_eigh_gpu(G, max_sweeps=2):
     batch, K, _ = G.shape
     device = G.device
 
+    # Use torch.linalg.eigh when available (K >= 32 on this platform)
+    if K >= 32:
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(G)
+            return eigvals.flip(-1).clamp_min(0.0), eigvecs.flip(-1)
+        except RuntimeError:
+            pass  # fall through to GPU Jacobi
+
     G_work = G.contiguous()
     V = _empty_batched_eye(batch, K, device)
 
     step_tensors = _get_step_tensors(K, device)
 
     if step_tensors:
-        max_pairs = max(n for _, _, n in step_tensors)
-        c_buf = torch.empty((batch * max_pairs,), device=device, dtype=torch.float32)
-        s_buf = torch.empty((batch * max_pairs,), device=device, dtype=torch.float32)
-
-        BLK = 64
+        # 2D / small batch / large K 情况下，BLK 取 128 可以减少循环次数。
+        # 对 K=256/512 比 BLK=64 更合适。
+        if batch <= 4 and K >= 256:
+            BLK = 128
+            num_warps = 4
+        else:
+            BLK = 64
+            num_warps = 4
 
         for _ in range(max_sweeps):
             for i_t, j_t, npairs in step_tensors:
                 grid = (batch * npairs,)
 
-                _jacobi_eig_row_kernel[grid](
-                    G_work,
-                    K,
-                    i_t,
-                    j_t,
-                    c_buf,
-                    s_buf,
-                    NUM_PAIRS=npairs,
-                    BLK=BLK,
-                    num_warps=4,
-                )
-
-                _jacobi_eig_col_kernel[grid](
+                _jacobi_eig_rowcol_fused_kernel[grid](
                     G_work,
                     V,
                     K,
                     i_t,
                     j_t,
-                    c_buf,
-                    s_buf,
                     NUM_PAIRS=npairs,
                     BLK=BLK,
-                    num_warps=4,
+                    num_warps=num_warps,
                 )
 
     S_sq = torch.empty((batch, K), device=device, dtype=torch.float32)
+
     block = _next_power_of_2(K)
     block = min(max(block, 16), 1024)
 
@@ -1333,6 +1460,16 @@ def _sort_svd_kernel(
 
 def _sort_svd(S_sq, V):
     batch, K = S_sq.shape
+
+    if batch <= 4 and K >= 128:
+        vals, order = torch.sort(S_sq, dim=-1, descending=True)
+        S = torch.sqrt(vals.clamp_min(0.0))
+
+        gather_index = order.unsqueeze(-2).expand(batch, K, K)
+        V_sorted = torch.gather(V, -1, gather_index)
+
+        return S, V_sorted
+
     device = S_sq.device
 
     S = torch.empty((batch, K), device=device, dtype=torch.float32)
@@ -1429,9 +1566,16 @@ def _compute_other_vectors(A, eigvecs, S, b, m, n):
 
     OTHER = torch.empty((b, out_rows, K), device=device, dtype=torch.float32)
 
-    BM = 16
-    BN = 16
-    BK = 32
+    if b <= 4 and K >= 128:
+        BM = 32
+        BN = 32
+        BK = 32
+        num_warps = 4
+    else:
+        BM = 16
+        BN = 16
+        BK = 32
+        num_warps = 4
 
     grid = (b, triton.cdiv(out_rows, BM), triton.cdiv(K, BN))
 
@@ -1448,7 +1592,7 @@ def _compute_other_vectors(A, eigvecs, S, b, m, n):
         BM=BM,
         BN=BN,
         BK=BK,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=3,
     )
 

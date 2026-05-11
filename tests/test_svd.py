@@ -1,6 +1,6 @@
-"""Accuracy tests for the SVD operator — compares FlagGems Triton SVD
-against PyTorch's torch.linalg.svd. Only float32 is tested since it is
-the sole dtype supported by torch.linalg.svd on this platform.
+"""Accuracy tests for torch.svd — covers all supported dtype/parameter combos.
+
+Only float32 is supported on this platform (torch.svd CUDA limitation).
 """
 
 import pytest
@@ -12,113 +12,124 @@ from . import accuracy_utils as utils
 
 DTYPE = torch.float32
 
+SHAPES_2D = [(1, 1), (8, 8), (16, 16), (16, 8), (8, 32)]
+SHAPES_3D = [(2, 4, 4), (4, 8, 8)]
+SHAPES_4D = [(2, 3, 4, 4)]
+SHAPES_EMPTY = [(0, 3), (3, 0), (2, 3, 0)]
 
-# Run sacrificial SVD pass *inside* each test to trigger JIT compilation
-# before the actual (verified) call.  This works around a platform-specific
-# Triton issue where the first kernel launch for a set of constexpr
-# parameters produces incorrect values.
-def _warmup_call(inp, full_matrices):
-    with flag_gems.use_gems():
-        _ = torch.linalg.svd(inp, full_matrices=full_matrices)
-    torch.cuda.synchronize()
+SOME_VALUES = [True, False]
+COMPUTE_UV_VALUES = [True, False]
 
 
-def _verify(shape, full_matrices, inp, res_U, res_S, res_Vh, ref_U, ref_S, ref_Vh):
-    """Common verification: shapes, singular values, reconstruction, orthogonality."""
-    assert res_U.shape == ref_U.shape
-    assert res_S.shape == ref_S.shape
-    assert res_Vh.shape == ref_Vh.shape
-
-    utils.gems_assert_close(res_S, ref_S.to(inp.device), torch.float32, equal_nan=True)
-
-    m, n = shape[-2], shape[-1]
-    k = min(m, n)
-    recon = (res_U[..., :, :k] * res_S.unsqueeze(-2)) @ res_Vh[..., :k, :]
-    utils.gems_assert_close(recon, inp, DTYPE, equal_nan=True)
-
-    eye = torch.eye(k, dtype=DTYPE, device=flag_gems.device)
-    utu = res_U[..., :, :k].transpose(-2, -1) @ res_U[..., :, :k]
-    utils.gems_assert_close(utu, eye, DTYPE, equal_nan=True)
-    vvt = res_Vh[..., :k, :] @ res_Vh[..., :k, :].transpose(-2, -1)
-    utils.gems_assert_close(vvt, eye, DTYPE, equal_nan=True)
+def _reconstruct(u, s, v):
+    k = s.shape[-1]
+    return (u[..., :, :k] * s.unsqueeze(-2)) @ v[..., :, :k].transpose(-2, -1)
 
 
 # ---------------------------------------------------------------------------
-# 2D — full_matrices parametrized
+# 2D shapes — all some × compute_uv combos
 # ---------------------------------------------------------------------------
-
-SHAPES_2D = [
-    (1, 1),
-    (8, 8),
-    (64, 8),
-    (4, 16),
-]
-
 
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", SHAPES_2D)
-@pytest.mark.parametrize("full_matrices", [False, True])
-def test_svd_2d(shape, full_matrices):
+@pytest.mark.parametrize("some", SOME_VALUES)
+@pytest.mark.parametrize("compute_uv", COMPUTE_UV_VALUES)
+def test_svd_2d(shape, some, compute_uv):
     inp = torch.randn(shape, dtype=DTYPE, device=flag_gems.device)
-    _warmup_call(inp, full_matrices)
     ref_inp = utils.to_reference(inp, True)
+    ref_u, ref_s, ref_v = torch.svd(ref_inp, some=some, compute_uv=compute_uv)
 
-    ref_U, ref_S, ref_Vh = torch.linalg.svd(ref_inp, full_matrices=full_matrices)
+    with flag_gems.use_gems(include=["svd"]):
+        res_u, res_s, res_v = torch.svd(inp, some=some, compute_uv=compute_uv)
 
-    with flag_gems.use_gems():
-        res_U, res_S, res_Vh = torch.linalg.svd(inp, full_matrices=full_matrices)
+    assert res_u.shape == ref_u.shape, f"U shape: {res_u.shape} vs {ref_u.shape}"
+    assert res_s.shape == ref_s.shape, f"S shape: {res_s.shape} vs {ref_s.shape}"
+    assert res_v.shape == ref_v.shape, f"V shape: {res_v.shape} vs {ref_v.shape}"
 
-    _verify(shape, full_matrices, inp, res_U, res_S, res_Vh, ref_U, ref_S, ref_Vh)
+    utils.gems_assert_close(res_s, ref_s.to(inp.device), torch.float32, equal_nan=True)
+
+    if compute_uv and min(shape[-2], shape[-1]) > 0:
+        recon = _reconstruct(res_u, res_s, res_v)
+        utils.gems_assert_close(recon, inp, DTYPE, equal_nan=True)
 
 
 # ---------------------------------------------------------------------------
-# Batched (3D / 4D)
+# 3D / 4D batched
 # ---------------------------------------------------------------------------
-
-SHAPES_ND = [(2, 16, 16), (2, 3, 16, 16)]
-
 
 @pytest.mark.svd
-@pytest.mark.parametrize("shape", SHAPES_ND)
-@pytest.mark.parametrize("full_matrices", [False, True])
-def test_svd_batched(shape, full_matrices):
+@pytest.mark.parametrize("shape", SHAPES_3D + SHAPES_4D)
+@pytest.mark.parametrize("some", SOME_VALUES)
+@pytest.mark.parametrize("compute_uv", COMPUTE_UV_VALUES)
+def test_svd_batched(shape, some, compute_uv):
     inp = torch.randn(shape, dtype=DTYPE, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)
+    ref_u, ref_s, ref_v = torch.svd(ref_inp, some=some, compute_uv=compute_uv)
 
-    ref_U, ref_S, ref_Vh = torch.linalg.svd(ref_inp, full_matrices=full_matrices)
+    with flag_gems.use_gems(include=["svd"]):
+        res_u, res_s, res_v = torch.svd(inp, some=some, compute_uv=compute_uv)
 
-    with flag_gems.use_gems():
-        res_U, res_S, res_Vh = torch.linalg.svd(inp, full_matrices=full_matrices)
-
-    assert res_U.shape == ref_U.shape
-    assert res_S.shape == ref_S.shape
-    assert res_Vh.shape == ref_Vh.shape
-
-    utils.gems_assert_close(res_S, ref_S.to(inp.device), torch.float32, equal_nan=True)
-
-    k = min(shape[-2], shape[-1])
-    recon = (res_U[..., :, :k] * res_S.unsqueeze(-2)) @ res_Vh[..., :k, :]
-    utils.gems_assert_close(recon, inp, DTYPE, equal_nan=True)
+    assert res_u.shape == ref_u.shape
+    assert res_s.shape == ref_s.shape
+    assert res_v.shape == ref_v.shape
+    utils.gems_assert_close(res_s, ref_s.to(inp.device), torch.float32, equal_nan=True)
 
 
 # ---------------------------------------------------------------------------
 # Empty
 # ---------------------------------------------------------------------------
 
-SHAPES_EMPTY = [(4, 0), (0, 3)]
-
-
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", SHAPES_EMPTY)
 def test_svd_empty(shape):
     inp = torch.randn(shape, dtype=DTYPE, device=flag_gems.device)
     ref_inp = utils.to_reference(inp, True)
+    ref_u, ref_s, ref_v = torch.svd(ref_inp)
 
-    ref_U, ref_S, ref_Vh = torch.linalg.svd(ref_inp, full_matrices=False)
+    with flag_gems.use_gems(include=["svd"]):
+        res_u, res_s, res_v = torch.svd(inp)
 
-    with flag_gems.use_gems():
-        res_U, res_S, res_Vh = torch.linalg.svd(inp, full_matrices=False)
+    assert res_u.shape == ref_u.shape
+    assert res_s.shape == ref_s.shape
+    assert res_v.shape == ref_v.shape
 
-    assert res_U.shape == ref_U.shape
-    assert res_S.shape == ref_S.shape
-    assert res_Vh.shape == ref_Vh.shape
+
+# ---------------------------------------------------------------------------
+# Special matrices
+# ---------------------------------------------------------------------------
+
+@pytest.mark.svd
+@pytest.mark.parametrize("n", [3, 8, 16])
+@pytest.mark.parametrize("mat_type", ["identity", "diagonal"])
+def test_svd_special_matrices(n, mat_type):
+    device = flag_gems.device
+    if mat_type == "identity":
+        inp = torch.eye(n, dtype=DTYPE, device=device)
+    else:
+        inp = torch.diag(torch.arange(1, n + 1, dtype=DTYPE, device=device))
+
+    ref_u, ref_s, ref_v = torch.svd(inp.cpu())
+    with flag_gems.use_gems(include=["svd"]):
+        res_u, res_s, res_v = torch.svd(inp)
+
+    utils.gems_assert_close(res_s, ref_s.to(device), torch.float32, equal_nan=True)
+    recon = _reconstruct(res_u, res_s, res_v)
+    utils.gems_assert_close(recon, inp, DTYPE, equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# Non-contiguous
+# ---------------------------------------------------------------------------
+
+@pytest.mark.svd
+@pytest.mark.parametrize("shape", [(8, 5), (3, 16, 8)])
+def test_svd_non_contiguous(shape):
+    inp = torch.randn(shape, dtype=DTYPE, device=flag_gems.device).transpose(-2, -1)
+    ref_inp = utils.to_reference(inp, True)
+    ref_u, ref_s, ref_v = torch.svd(ref_inp)
+
+    with flag_gems.use_gems(include=["svd"]):
+        res_u, res_s, res_v = torch.svd(inp)
+
+    assert res_u.shape == ref_u.shape
+    utils.gems_assert_close(res_s, ref_s.to(inp.device), torch.float32, equal_nan=True)

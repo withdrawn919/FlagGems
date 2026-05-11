@@ -1,310 +1,272 @@
-"""One-sided Jacobi SVD with fused GPU kernels.
+"""SVD operator — Triton-native paths for torch.svd.
 
-Optimizations:
-- Fused Jacobi step kernel (Gram + rotation + A_t update + V update)
-- Pairs tensors pre-built once, reused across sweeps
-- All pairs for all steps packed into one GPU tensor (2D layout)
-- Adaptive BLOCK_M sizing
-- Convergence check every few sweeps via GPU reduction
-- V stored transposed (Vt) for contiguous column access
-- full_matrices=True uses torch.linalg.qr for stable complement
-
-Reference: Hestenes one-sided Jacobi method with Brent-Luk parallel ordering.
+Paths:
+- K<=8:  register-based fused Jacobi SVD kernel
+- K>8 :  Gram via Triton tl.dot + Jacobi eigendecomposition via Triton kernel
 """
 
-import logging
-
-import torch
-import triton
-import triton.language as tl
+import math, logging
+from collections import namedtuple
+import torch, triton, triton.language as tl
+from flag_gems.utils import libentry, triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
+_FALLBACK_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd)
 
-
-# ---------------------------------------------------------------------------
-# Brent-Luk parallel ordering
-# ---------------------------------------------------------------------------
-
-def _brent_luk_pairs(n: int):
-    if n <= 1:
-        return []
-    all_steps = []
-    n_eff = n if n % 2 == 0 else n + 1
-    for step in range(n_eff - 1):
-        pairs = []
-        for k in range(n_eff // 2):
-            i = (step + k) % (n_eff - 1)
-            j = n_eff - 1 if k == 0 else (step + n_eff - 1 - k) % (n_eff - 1)
-            if i < n and j < n:
-                pairs.append((i, j))
-        all_steps.append(pairs)
-    return all_steps
-
-
-def _build_pairs_tensor(all_steps, device):
-    """Pack all Jacobi step pairs into a single GPU tensor.
-
-    Layout: (total_steps, 2 * max_pairs)  — row-major per step.
-    Each row stores [i0, i1, ..., iP, j0, j1, ..., jP] with zero-padding.
-    Returns (pairs_all, max_pairs, step_offsets).
-    """
-    num_steps = len(all_steps)
-    max_pairs = max((len(s) for s in all_steps), default=0)
-    if max_pairs == 0:
-        return None, 0, []
-    flat = []
-    step_offsets = []
-    for step_pairs in all_steps:
-        step_offsets.append(len(flat))
-        for i, j in step_pairs:
-            flat.append(i)
-        for i, j in step_pairs:
-            flat.append(j)
-        pad_n = max_pairs - len(step_pairs)
-        flat.extend([0] * pad_n + [0] * pad_n)
-    return torch.tensor(flat, device=device, dtype=torch.int32), max_pairs, step_offsets
-
+def _fallback_svd(input, full_matrices=True):
+    return torch.ops.aten.linalg_svd.default.redispatch(_FALLBACK_KEYSET, input, full_matrices)
 
 # ---------------------------------------------------------------------------
-# Kernel: fused Jacobi step
+# Helpers
 # ---------------------------------------------------------------------------
+def _is_fp32_cuda_mat(x): return x.is_cuda and x.dtype == torch.float32 and x.ndim >= 2
+def _svd_dims(x):
+    if x.ndim < 2: return 0,0,0
+    m,n = x.shape[-2],x.shape[-1]
+    b = 1
+    for d in x.shape[:-2]: b *= d
+    return b,m,n
+def _can_rank1(x):
+    _,m,n = _svd_dims(x); return _is_fp32_cuda_mat(x) and min(m,n)==1
+def _can_small_jacobi(x):
+    _,m,n = _svd_dims(x); return _is_fp32_cuda_mat(x) and min(m,n)<=8 and max(m,n)<=1024
 
+# ---------------------------------------------------------------------------
+# Brent-Luk pairs for Jacobi eigendecomposition
+# ---------------------------------------------------------------------------
+def _brent_luk_pairs(K):
+    if K <= 1: return []
+    steps = []
+    n_eff = K if K%2==0 else K+1
+    for s in range(n_eff-1):
+        i_l, j_l = [], []
+        for k in range(n_eff//2):
+            i = (s+k)%(n_eff-1); j = n_eff-1 if k==0 else (s+n_eff-1-k)%(n_eff-1)
+            if i<K and j<K: i_l.append(i); j_l.append(j)
+        if i_l: steps.append((i_l, j_l))
+    return steps
+
+# ---------------------------------------------------------------------------┴
+# rank-1 kernel
+# ---------------------------------------------------------------------------
+@libentry()
 @triton.jit
-def jacobi_step_kernel(
-    A_t_ptr,
-    V_ptr,         # (batch, n, n) row-major
-    m: tl.constexpr,
-    n: tl.constexpr,
-    pairs_ptr,     # row in pairs_all for current step
-    num_pairs: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    pair_id = pid % num_pairs
-    batch_id = pid // num_pairs
+def _rank1_kernel(x,u,s,vh,b,M:tl.constexpr,N:tl.constexpr,T:tl.constexpr,BM:tl.constexpr):
+    pid=tle.program_id(0); rows=tl.arange(0,BM); sz=tl.maximum(M,N)
+    vals=tl.load(x+pid*M*N+(rows if T else rows*N),mask=rows<sz,other=0.0).to(tl.float32)
+    sq=tl.sum(vals*vals,axis=0); nrm=tl.sqrt(tl.maximum(sq,0.0)); inv=1.0/tl.sqrt(tl.maximum(sq,1e-30))
+    uvals=vals*inv; tl.store(s+pid,nrm)
+    if T: tl.store(u+pid*M+rows,uvals,mask=rows<sz); tl.store(vh+pid,1.0)
+    else:  tl.store(u+pid,1.0); tl.store(vh+pid*N+rows,uvals,mask=rows<sz)
 
-    i = tl.load(pairs_ptr + pair_id).to(tl.int32)
-    j = tl.load(pairs_ptr + pair_id + num_pairs).to(tl.int32)
-
-    row_i = batch_id * n * m + i * m
-    row_j = batch_id * n * m + j * m
-
-    # --- Gram accumulation ---
-    a_ii = tl.zeros([1], dtype=tl.float32)
-    a_ij = tl.zeros([1], dtype=tl.float32)
-    a_jj = tl.zeros([1], dtype=tl.float32)
-
-    for m_start in range(0, m, BLOCK_M):
-        offs = m_start + tl.arange(0, BLOCK_M)
-        mask = offs < m
-        ci = tl.load(A_t_ptr + row_i + offs, mask=mask, other=0.0).to(tl.float32)
-        cj = tl.load(A_t_ptr + row_j + offs, mask=mask, other=0.0).to(tl.float32)
-        a_ii += tl.sum(ci * ci, axis=0)
-        a_ij += tl.sum(ci * cj, axis=0)
-        a_jj += tl.sum(cj * cj, axis=0)
-
-    a_ii_s = tl.sum(a_ii, axis=0)
-    a_ij_s = tl.sum(a_ij, axis=0)
-    a_jj_s = tl.sum(a_jj, axis=0)
-
-    # --- Jacobi rotation ---
-    tau = (a_ii_s - a_jj_s) / (2.0 * a_ij_s + 1e-30)
-    t_pos = 1.0 / (tau + tl.sqrt(1.0 + tau * tau))
-    t_neg = -1.0 / (-tau + tl.sqrt(1.0 + tau * tau))
-    t = tl.where(tau >= 0.0, t_pos, t_neg)
-    off = tl.abs(a_ij_s) / (tl.sqrt(tl.abs(a_ii_s * a_jj_s)) + 1e-30)
-    t = tl.where(off < 1e-10, 0.0, t)
-
-    cos = 1.0 / tl.sqrt(1.0 + t * t)
-    sin = t * cos
-
-    # --- Apply rotation to A_t columns ---
-    for m_start in range(0, m, BLOCK_M):
-        offs = m_start + tl.arange(0, BLOCK_M)
-        mask = offs < m
-        ci = tl.load(A_t_ptr + row_i + offs, mask=mask, other=0.0).to(tl.float32)
-        cj = tl.load(A_t_ptr + row_j + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(A_t_ptr + row_i + offs, cos * ci + sin * cj, mask=mask)
-        tl.store(A_t_ptr + row_j + offs, -sin * ci + cos * cj, mask=mask)
-
-    # --- Apply rotation to V columns ---
-    v_batch_off = batch_id * n * n
-    for r in range(0, n, 64):
-        rows = r + tl.arange(0, 64)
-        mask = rows < n
-        vi = tl.load(V_ptr + v_batch_off + rows * n + i, mask=mask, other=0.0).to(tl.float32)
-        vj = tl.load(V_ptr + v_batch_off + rows * n + j, mask=mask, other=0.0).to(tl.float32)
-        tl.store(V_ptr + v_batch_off + rows * n + i, cos * vi + sin * vj, mask=mask)
-        tl.store(V_ptr + v_batch_off + rows * n + j, -sin * vi + cos * vj, mask=mask)
-
+def _rank1(x,full=True):
+    b,m,n=_svd_dims(x); tall=m>=n; sz=max(m,n); dev,dt=x.device,x.dtype
+    u=torch.empty(b,m,1,device=dev,dtype=dt); vh=torch.empty(b,1,n,device=dev,dtype=dt)
+    s=torch.empty(b,1,device=dev,dtype=torch.float32)
+    _rank1_kernel[(b,)](x,u,s,vh,b,m,n,tall,BM=min(1024,triton.next_power_of_2(sz)))
+    return u,s,vh.mT
 
 # ---------------------------------------------------------------------------
-# Kernel: normalize
+# small Jacobi SVD (K <= 8, register-based)
 # ---------------------------------------------------------------------------
-
+@libentry()
 @triton.jit
-def normalize_kernel(
-    A_t_ptr, S_ptr, U_ptr,
-    m: tl.constexpr, n: tl.constexpr, BLOCK_M: tl.constexpr,
+def _small_jacobi_kernel(A,aw,vw,U,S,Vh,M:tl.constexpr,K:tl.constexpr,T:tl.constexpr,
+                          SW:tl.constexpr,BM:tl.constexpr,BK:tl.constexpr):
+    pid=tle.program_id(0); rows=tl.arange(0,BM); cols=tl.arange(0,BK)
+    rm=rows<M; cm=cols<K; eps=1e-20
+    ab=A+pid*M*K; awb=aw+pid*K*M; vwb=vw+pid*K*K
+    for j in tl.static_range(0,K):
+        v=tl.load(ab+(rows*K+j if T else j*M+rows),mask=rm,other=0.0).to(tl.float32)
+        tl.store(awb+j*M+rows,v,mask=rm); tl.store(vwb+j*K+cols,tl.where(cols==j,1.0,0.0),mask=cm)
+    for _ in tl.static_range(0,SW):
+        for p in tl.static_range(0,K):
+            for q in tl.static_range(p+1,K):
+                ap=tl.load(awb+p*M+rows,mask=rm,other=0.0); aq=tl.load(awb+q*M+rows,mask=rm,other=0.0)
+                al=tl.sum(ap*ap); be=tl.sum(aq*aq); ga=tl.sum(ap*aq)
+                ac=tl.abs(ga)>1e-7*tl.sqrt(al*be+eps)
+                tau=(be-al)/(2.0*ga+1e-30); sg=tl.where(tau>=0,1.0,-1.0)
+                t_=sg/(tl.abs(tau)+tl.sqrt(1+tau*tau)); c=tl.where(ac,tl.rsqrt(1+t_*t_),1.0); s=tl.where(ac,t_*c,0.0)
+                tl.store(awb+p*M+rows,c*ap-s*aq,mask=rm); tl.store(awb+q*M+rows,s*ap+c*aq,mask=rm)
+                vp=tl.load(vwb+p*K+cols,mask=cm,other=0.0); vq=tl.load(vwb+q*K+cols,mask=cm,other=0.0)
+                tl.store(vwb+p*K+cols,c*vp-s*vq,mask=cm); tl.store(vwb+q*K+cols,s*vp+c*vq,mask=cm)
+    for col in tl.static_range(0,K):
+        v=tl.load(awb+col*M+rows,mask=rm,other=0.0); sq=tl.sum(v*v,axis=0)
+        nm=tl.sqrt(tl.maximum(sq,0.0)); tl.store(S+pid*K+col,nm)
+        inv=1.0/tl.sqrt(tl.maximum(sq,1e-30)); tl.store(U+pid*M*K+rows*K+col,v*inv,mask=rm)
+    for col in tl.static_range(0,K):
+        v=tl.load(vwb+col*K+cols,mask=cm,other=0.0); tl.store(Vh+pid*K*K+cols*K+col,v,mask=cm)
+
+def _small_jacobi(x,full=True):
+    b,m,n=_svd_dims(x); dev,dt=x.device,x.dtype; tall=m>=n; M=max(m,n); K=min(m,n)
+    A=x if tall else x.transpose(-2,-1)
+    if A.ndim==2: A=A.unsqueeze(0).contiguous()
+    else: A=A.reshape(b,M,K).contiguous()
+    aw=torch.empty(b,K,M,device=dev,dtype=torch.float32)
+    vw=torch.empty(b,K,K,device=dev,dtype=torch.float32)
+    U=torch.empty(b,M,K,device=dev,dtype=dt); S=torch.empty(b,K,device=dev,dtype=torch.float32)
+    Vh=torch.empty(b,K,K,device=dev,dtype=dt)
+    BM=min(1024,triton.next_power_of_2(M)); SW=min(K,12)
+    _small_jacobi_kernel[(b,)](A,aw,vw,U,S,Vh,M=M,K=K,T=True,SW=SW,BM=BM,BK=triton.next_power_of_2(K),
+                                num_warps=4 if M<=64 else 8)
+    S,idx=S.sort(dim=-1,descending=True); U=U.gather(-1,idx.unsqueeze(-2).expand_as(U))
+    Sinv=1.0/S.clamp_min(1e-30); Vh=Sinv.unsqueeze(-1)*U.float().transpose(-2,-1)@A.float()
+    V=Vh.mT.to(dt)
+    if not tall: U,V=V,U
+    return U,S,V
+
+# ---------------------------------------------------------------------------
+# Gram kernel (Triton tl.dot)
+# ---------------------------------------------------------------------------
+@libentry()
+@triton.jit
+def _gram_kernel(x,g,b,M:tl.constexpr,N:tl.constexpr,BN:tl.constexpr,BM:tl.constexpr):
+    pb=tle.program_id(0); pi=tle.program_id(1); pj=tle.program_id(2)
+    oi=pi*BN+tl.arange(0,BN); oj=pj*BN+tl.arange(0,BN); om=tl.arange(0,BM)
+    mi=oi<N; mj=oj<N; acc=tl.zeros((BN,BN),dtype=tl.float32)
+    for m0 in range(0,M,BM):
+        m=m0+om; mm=m<M
+        ai=tl.load(x+pb*M*N+m[:,None]*N+oi[None,:],mask=mm[:,None]&mi[None,:],other=0.0).to(tl.float32)
+        aj=tl.load(x+pb*M*N+m[:,None]*N+oj[None,:],mask=mm[:,None]&mj[None,:],other=0.0).to(tl.float32)
+        acc+=tl.dot(tl.trans(ai),aj,input_precision="ieee")
+    tl.store(g+pb*N*N+oi[:,None]*N+oj[None,:],acc,mask=mi[:,None]&mj[None,:])
+
+# ---------------------------------------------------------------------------
+# Jacobi eigendecomposition of G (b, K, K) via Triton kernels
+# ---------------------------------------------------------------------------
+@libentry()
+@triton.jit
+def _jacobi_eig_row_kernel(
+    G_ptr, K: tl.constexpr,
+    i_idx_ptr, j_idx_ptr, c_ptr, s_ptr, num_pairs: tl.constexpr, BLK: tl.constexpr,
 ):
-    col_id = tl.program_id(0)
-    batch_id = tl.program_id(1)
-    row_off = batch_id * n * m + col_id * m
+    pid = tle.program_id(0)
+    pair_id = pid % num_pairs; batch_id = pid // num_pairs
+    ii = tl.load(i_idx_ptr + pair_id).to(tl.int32); jj = tl.load(j_idx_ptr + pair_id).to(tl.int32)
 
-    acc = tl.zeros([1], dtype=tl.float32)
-    for m_start in range(0, m, BLOCK_M):
-        offs = m_start + tl.arange(0, BLOCK_M)
-        mask = offs < m
-        vals = tl.load(A_t_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)
-        acc += tl.sum(vals * vals, axis=0)
+    # Compute rotation from G entries (inside kernel, no Python GPU indexing)
+    g_off = batch_id * K * K
+    g_pp = tl.load(G_ptr + g_off + ii * K + ii).to(tl.float32)
+    g_qq = tl.load(G_ptr + g_off + jj * K + jj).to(tl.float32)
+    g_pq = tl.load(G_ptr + g_off + ii * K + jj).to(tl.float32)
+    tau = (g_pp - g_qq) / (2.0 * g_pq + 1e-30)
+    sg = tl.where(tau >= 0.0, 1.0, -1.0)
+    t_val = sg / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
+    c_val = tl.rsqrt(1.0 + t_val * t_val)
+    s_val = t_val * c_val
 
-    sigma = tl.sqrt(tl.sum(acc, axis=0))
-    tl.store(S_ptr + batch_id * n + col_id, sigma)
+    # Output c, s for column+V kernel
+    tl.store(c_ptr + pid, c_val)
+    tl.store(s_ptr + pid, s_val)
 
-    safe_sigma = sigma + 1e-30
-    for m_start in range(0, m, BLOCK_M):
-        offs = m_start + tl.arange(0, BLOCK_M)
-        mask = offs < m
-        vals = tl.load(A_t_ptr + row_off + offs, mask=mask, other=0.0).to(tl.float32)
-        tl.store(U_ptr + batch_id * m * n + offs * n + col_id, vals / safe_sigma, mask=mask)
+    # Row update: G = R^T @ G
+    for k in range(0, K, BLK):
+        off = k + tl.arange(0, BLK); mask = off < K
+        gi = tl.load(G_ptr + g_off + ii * K + off, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G_ptr + g_off + jj * K + off, mask=mask, other=0.0).to(tl.float32)
+        tl.store(G_ptr + g_off + ii * K + off, c_val * gi + s_val * gj, mask=mask)
+        tl.store(G_ptr + g_off + jj * K + off, -s_val * gi + c_val * gj, mask=mask)
 
+@libentry()
+@triton.jit
+def _jacobi_eig_col_kernel(
+    G_ptr, V_ptr, K: tl.constexpr,
+    i_idx_ptr, j_idx_ptr, c_ptr, s_ptr, num_pairs: tl.constexpr, BLK: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    pair_id = pid % num_pairs; batch_id = pid // num_pairs
+    ii = tl.load(i_idx_ptr + pair_id).to(tl.int32); jj = tl.load(j_idx_ptr + pair_id).to(tl.int32)
+    c_val = tl.load(c_ptr + pid).to(tl.float32)
+    s_val = tl.load(s_ptr + pid).to(tl.float32)
+    g_off = batch_id * K * K; v_off = batch_id * K * K
+    for k in range(0, K, BLK):
+        off = k + tl.arange(0, BLK); mask = off < K
+        gi = tl.load(G_ptr + g_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G_ptr + g_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        tl.store(G_ptr + g_off + off * K + ii, c_val * gi + s_val * gj, mask=mask)
+        tl.store(G_ptr + g_off + off * K + jj, -s_val * gi + c_val * gj, mask=mask)
+    for k in range(0, K, BLK):
+        off = k + tl.arange(0, BLK); mask = off < K
+        vi = tl.load(V_ptr + v_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        vj = tl.load(V_ptr + v_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        tl.store(V_ptr + v_off + off * K + ii, c_val * vi + s_val * vj, mask=mask)
+        tl.store(V_ptr + v_off + off * K + jj, -s_val * vi + c_val * vj, mask=mask)
+
+
+def _jacobi_eigh_gpu(G, max_sweeps=5):
+    batch, K, _ = G.shape
+    device, dtype = G.device, G.dtype
+    G_work = G.float().clone()
+    V = torch.eye(K, device=device, dtype=torch.float32).unsqueeze(0).expand(batch, K, K).clone()
+
+    steps = _brent_luk_pairs(K)
+    if not steps:
+        return G.diagonal(dim1=-2, dim2=-1).clamp_min(0.0), V.to(dtype)
+
+    # Pre-build index tensors for all steps
+    step_tensors = []
+    for i_l, j_l in steps:
+        step_tensors.append((
+            torch.tensor(i_l, device=device, dtype=torch.int32),
+            torch.tensor(j_l, device=device, dtype=torch.int32),
+            len(i_l)
+        ))
+
+    BLK = 64
+    # Single c/s buffer reused across all steps (max size = K/2 * batch)
+    max_pairs = max(len(il) for il, _ in steps)
+    cs_buf_c = torch.empty(batch * max_pairs, device=device, dtype=torch.float32)
+    cs_buf_s = torch.empty(batch * max_pairs, device=device, dtype=torch.float32)
+    for _ in range(max_sweeps):
+        for i_t, j_t, npairs in step_tensors:
+            _jacobi_eig_row_kernel[(npairs * batch,)](G_work, K, i_t, j_t, cs_buf_c, cs_buf_s,
+                                                       num_pairs=npairs, BLK=BLK)
+            _jacobi_eig_col_kernel[(npairs * batch,)](G_work, V, K, i_t, j_t, cs_buf_c, cs_buf_s,
+                                                       num_pairs=npairs, BLK=BLK)
+
+    S_sq = G_work.diagonal(dim1=-2, dim2=-1).clamp_min(0.0)
+    return S_sq, V.to(dtype)
+
+
+def _svd_gram_jacobi(x, full=True):
+    b,m,n=_svd_dims(x); dev,dt=x.device,x.dtype; tall=m>=n; M=max(m,n); K=min(m,n)
+    if tall: X=x.reshape(b,m,n)
+    else:    X=x.reshape(b,m,n).transpose(-2,-1)
+
+    gram=torch.zeros(b,K,K,device=dev,dtype=torch.float32)
+    grid=(b,triton.cdiv(K,32),triton.cdiv(K,32))
+    _gram_kernel[grid](X,gram,b,M=M,N=K,BN=32,BM=64,num_warps=4,num_stages=2)
+
+    S_sq,V_cols=_jacobi_eigh_gpu(gram)
+    S_sq,idx=S_sq.sort(dim=-1,descending=True)
+    V_cols=V_cols.gather(-1,idx.unsqueeze(-2).expand_as(V_cols))
+    S=S_sq.clamp_min(0.0).sqrt()
+    U=(X.float()@V_cols.float())/S.unsqueeze(-2).clamp_min(1e-30)
+    U=U.to(dt); V=V_cols.to(dt)
+    U,S,V=U,S,V
+    if not tall: U,V=V,U
+    return U,S,V
 
 # ---------------------------------------------------------------------------
-# Helper: full_matrices U extension via QR
+# Public API
 # ---------------------------------------------------------------------------
-
-def _extend_U_to_square(U: torch.Tensor) -> torch.Tensor:
-    """Extend U from (batch, m, n) to (batch, m, m) using QR on a random complement."""
-    batch_size, m, n = U.shape
-    if m - n <= 0:
-        return U
-    device, dtype = U.device, U.dtype
-    R = torch.randn(batch_size, m, m - n, device=device, dtype=dtype)
-    # Subtract projection onto existing U columns
-    Ut = U.transpose(-2, -1)
-    R = R - U @ (Ut @ R)
-    Q, _ = torch.linalg.qr(R)
-    return torch.cat([U, Q], dim=-1).to(dtype)
-
-
-# ---------------------------------------------------------------------------
-# Convergence check (CPU-side, called every few sweeps)
-# ---------------------------------------------------------------------------
-
-def _check_converged(A_t, step0, tol):
-    """Check if first column pair in step0 is nearly orthogonal."""
-    if len(step0) == 0:
-        return True
-    i, j = step0[0]
-    ci = A_t[:, i, :]
-    cj = A_t[:, j, :]
-    a_ij = (ci * cj).sum(dim=-1).abs()
-    a_ii = (ci * ci).sum(dim=-1)
-    a_jj = (cj * cj).sum(dim=-1)
-    off = a_ij / (a_ii * a_jj).sqrt().clamp_min(1e-30)
-    return off.max().item() < tol
-
-
-# ---------------------------------------------------------------------------
-# SVD
-# ---------------------------------------------------------------------------
-
-def svd(A: torch.Tensor, full_matrices: bool = True):
-    """One-sided Jacobi SVD with fused GPU kernels.
-
-    Args:
-        A: tensor of shape (..., m, n)
-        full_matrices: controls U/Vh shape (see torch.linalg.svd).
-
-    Returns:
-        (U, S, Vh)
-    """
-    if A.ndim < 2:
-        raise RuntimeError(f"linalg.svd: input must have >= 2 dims, got {A.ndim}")
-
-    original_batch_shape = A.shape[:-2]
-    m_orig, n_orig = A.shape[-2], A.shape[-1]
-    A = A.reshape(-1, m_orig, n_orig) if len(original_batch_shape) > 0 else A.unsqueeze(0)
-    batch_size = A.shape[0]
-
-    swapped = m_orig < n_orig
-    if swapped:
-        A = A.transpose(-2, -1)
-    m, n = A.shape[-2], A.shape[-1]
-    device, dtype = A.device, A.dtype
-
-    # Empty shortcut
-    if m == 0 or n == 0:
-        k = 0
-        U = torch.zeros(batch_size, m_orig, m_orig if full_matrices else k, device=device, dtype=dtype)
-        S = torch.zeros(batch_size, k, device=device, dtype=dtype)
-        Vh = torch.zeros(batch_size, n_orig if full_matrices else k, n_orig, device=device, dtype=dtype)
-        if len(original_batch_shape) == 0:
-            U, S, Vh = U.squeeze(0), S.squeeze(0), Vh.squeeze(0)
-        else:
-            U = U.reshape(*original_batch_shape, *U.shape[-2:])
-            S = S.reshape(*original_batch_shape, S.shape[-1])
-            Vh = Vh.reshape(*original_batch_shape, *Vh.shape[-2:])
-        return U, S, Vh
-
-    # A_t: (batch, n, m), V: (batch, n, n) — row-major
-    A_t = A.transpose(-2, -1).contiguous()
-    V = torch.eye(n, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, n, n).contiguous()
-
-    # Adaptive block size
-    BLOCK_M = 128 if m <= 128 else (256 if m <= 512 else (512 if m <= 2048 else 1024))
-
-    all_steps = _brent_luk_pairs(n)
-    if len(all_steps) > 0:
-        # Pre-build all pairs into a single GPU tensor
-        pairs_all, max_pairs, step_offsets = _build_pairs_tensor(all_steps, device)
-
-        max_sweeps, tol = 30, 1e-6
-        for sweep in range(max_sweeps):
-            for si, step_pairs in enumerate(all_steps):
-                num_pairs = len(step_pairs)
-                if num_pairs == 0:
-                    continue
-                jacobi_step_kernel[(num_pairs * batch_size,)](
-                    A_t, V, m, n,
-                    pairs_all[step_offsets[si]:],
-                    num_pairs=num_pairs, BLOCK_M=BLOCK_M,
-                )
-
-            # Convergence check every 5 sweeps
-            if sweep >= 4 and (sweep + 1) % 5 == 0:
-                if _check_converged(A_t, all_steps[0], tol):
-                    break
-
-    # Normalize
-    S = torch.empty(batch_size, n, device=device, dtype=torch.float32)
-    U = torch.empty(batch_size, m, n, device=device, dtype=torch.float32)
-    normalize_kernel[(n, batch_size)](A_t, S, U, m, n, BLOCK_M=BLOCK_M)
-
-    # Sort
-    S_sorted, idx = torch.sort(S, dim=-1, descending=True)
-    U_sorted = torch.gather(U, -1, idx.unsqueeze(-2).expand(-1, m, -1))
-    V_sorted = torch.gather(V, -1, idx.unsqueeze(1).expand(-1, n, -1))
-    Vh = V_sorted.transpose(-2, -1)
-
-    # full_matrices
-    if full_matrices and m > n:
-        U_final = _extend_U_to_square(U_sorted)
-        S_final, Vh_final = S_sorted, Vh
-    else:
-        U_final, S_final, Vh_final = U_sorted, S_sorted, Vh
-
-    if swapped:
-        U_final, Vh_final = Vh_final.transpose(-2, -1), U_final.transpose(-2, -1)
-
-    if len(original_batch_shape) == 0:
-        U_final, S_final, Vh_final = U_final.squeeze(0), S_final.squeeze(0), Vh_final.squeeze(0)
-    else:
-        U_final = U_final.reshape(*original_batch_shape, *U_final.shape[-2:])
-        S_final = S_final.reshape(*original_batch_shape, S_final.shape[-1])
-        Vh_final = Vh_final.reshape(*original_batch_shape, *Vh_final.shape[-2:])
-
-    if dtype != torch.float32:
-        U_final, S_final, Vh_final = U_final.to(dtype), S_final.to(dtype), Vh_final.to(dtype)
-
-    return U_final, S_final, Vh_final
+def svd(input, some=True, compute_uv=True):
+    fm = not some
+    if not compute_uv:
+        S=torch.linalg.svdvals(input); m,n=input.shape[-2],input.shape[-1]
+        U=torch.zeros(*input.shape[:-2],m,m,device=input.device,dtype=input.dtype)
+        V=torch.zeros(*input.shape[:-2],n,n,device=input.device,dtype=input.dtype)
+        return U,S,V
+    if not _is_fp32_cuda_mat(input) or not some or min(input.shape[-2],input.shape[-1])==0:
+        U,S,Vh=_fallback_svd(input,fm); return U,S,Vh.mH
+    was2d=input.ndim==2; obp=input.shape[:-2]
+    if was2d: aw=input.unsqueeze(0)
+    else:     aw=input.reshape(-1,*input.shape[-2:])
+    aw=aw.contiguous()
+    if _can_rank1(aw):        U,S,V=_rank1(aw)
+    elif _can_small_jacobi(aw): U,S,V=_small_jacobi(aw)
+    else:                      U,S,V=_svd_gram_jacobi(aw)
+    if was2d: U,S,V=U.squeeze(0),S.squeeze(0),V.squeeze(0)
+    elif len(obp)>0:
+        U=U.reshape(*obp,*U.shape[-2:]); S=S.reshape(*obp,S.shape[-1]); V=V.reshape(*obp,*V.shape[-2:])
+    return U,S,V

@@ -1,47 +1,20 @@
-import time
-
 import pytest
 import torch
 
-import flag_gems
-from flag_gems.ops.svd import svd as gems_svd
+from . import base
+
+
+class SvdBenchmark(base.Benchmark):
+    DEFAULT_SHAPE_DESC = "(*B), M, N"
+    DEFAULT_DTYPES = [torch.float32]
+
+    def get_input_iter(self, dtype):
+        for shape in self.shapes:
+            inp = torch.randn(shape, dtype=dtype, device=self.device)
+            yield inp, {"some": True, "compute_uv": True}
 
 
 @pytest.mark.svd
-def test_perf_svd():
-    """Minimal SVD benchmark: one shape, float32, Gems vs PyTorch."""
-    shape = (32, 32)
-    dtype = torch.float32
-    warmup = 5
-    iters = 10
-
-    A = torch.randn(shape, dtype=dtype, device=flag_gems.device)
-
-    # FlagGems
-    for _ in range(warmup):
-        _ = gems_svd(A, full_matrices=False)
-    torch.cuda.synchronize()
-
-    t0 = time.time()
-    for _ in range(iters):
-        _ = gems_svd(A, full_matrices=False)
-    torch.cuda.synchronize()
-    gems_ms = (time.time() - t0) / iters * 1000
-
-    # PyTorch
-    for _ in range(warmup):
-        _ = torch.linalg.svd(A, full_matrices=False)
-    torch.cuda.synchronize()
-
-    t0 = time.time()
-    for _ in range(iters):
-        _ = torch.linalg.svd(A, full_matrices=False)
-    torch.cuda.synchronize()
-    torch_ms = (time.time() - t0) / iters * 1000
-
-    speedup = torch_ms / gems_ms
-    print(
-        f"\n  SVD {shape} {dtype}: "
-        f"FlagGems={gems_ms:.2f}ms, PyTorch={torch_ms:.2f}ms, "
-        f"speedup={speedup:.2f}x"
-    )
+def test_svd():
+    bench = SvdBenchmark(op_name="svd", torch_op=torch.svd)
+    bench.run()

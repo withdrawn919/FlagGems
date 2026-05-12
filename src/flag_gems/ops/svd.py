@@ -7,7 +7,6 @@ import triton.language as tl
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
 
-
 logger = logging.getLogger(__name__)
 
 # FP32 only. For fp16/bf16, upcast to fp32 at entry and cast back.
@@ -19,6 +18,7 @@ _STEP_TENSOR_CACHE = {}
 # =============================================================================
 # Helpers
 # =============================================================================
+
 
 def _is_supported_input(x):
     return x.is_cuda and x.dtype in _SUPPORTED_SVD_DTYPES and x.ndim >= 2
@@ -61,7 +61,9 @@ def _brent_luk_pairs(K):
 
 
 def _cache_key_for_steps(device, K):
-    dev_index = device.index if device.index is not None else torch.cuda.current_device()
+    dev_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     return dev_index, K
 
 
@@ -88,6 +90,7 @@ def _get_step_tensors(K, device):
 # zero fill
 # =============================================================================
 
+
 @libentry()
 @triton.jit
 def _zero_fill_kernel(X, TOTAL: tl.constexpr, BLOCK: tl.constexpr):
@@ -110,6 +113,7 @@ def _empty_zero_tensor(shape, device, dtype):
 # =============================================================================
 # Rank-1 kernels
 # =============================================================================
+
 
 @libentry()
 @triton.jit
@@ -205,6 +209,7 @@ def _svd_rank1(A):
 # =============================================================================
 # 2x2 closed-form kernel
 # =============================================================================
+
 
 @libentry()
 @triton.jit
@@ -329,6 +334,7 @@ def _svd_2x2(A, compute_uv=True):
 # =============================================================================
 # Rank-2 closed-form kernels
 # =============================================================================
+
 
 @libentry()
 @triton.jit
@@ -508,6 +514,7 @@ def _svd_rank2(A):
 # =============================================================================
 # In-register one-sided Jacobi for small K
 # =============================================================================
+
 
 @libentry()
 @triton.jit
@@ -734,6 +741,7 @@ def _svd_small_jacobi(A):
 # Streaming Jacobi for batched K=64/128
 # =============================================================================
 
+
 @libentry()
 @triton.jit
 def svd_streaming_jacobi_kernel(
@@ -865,9 +873,9 @@ def svd_streaming_jacobi_kernel(
         s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
         j_vec = tl.full((BLOCK_N,), j, dtype=tl.int32)
 
-        ranks += (
-            ((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask
-        ).to(tl.int32)
+        ranks += (((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask).to(
+            tl.int32
+        )
 
     tl.store(s + pid * N + ranks, s_vals, mask=col_mask)
 
@@ -907,9 +915,8 @@ def _can_use_streaming_jacobi(A):
     k = min(m, n)
     max_dim = max(m, n)
 
-    return (
-        (k == 64 and max_dim <= 1024 and b >= 16)
-        or (k == 128 and max_dim <= 128 and b >= 16)
+    return (k == 64 and max_dim <= 1024 and b >= 16) or (
+        k == 128 and max_dim <= 128 and b >= 16
     )
 
 
@@ -1061,6 +1068,7 @@ def _compute_gram(A, b, m, n):
     else:
         BM = 64
         
+
     grid = (b, triton.cdiv(K, BN), triton.cdiv(K, BN))
 
     _gram_sym_kernel[grid](
@@ -1616,6 +1624,7 @@ def _svd_gram_jacobi(A, max_sweeps=2):
 # Full SVD completion for some=False
 # =============================================================================
 
+
 @libentry()
 @triton.jit
 def _copy_reduced_to_full_kernel(
@@ -1770,6 +1779,7 @@ def _make_full_matrices(U_red, V_red, m, n):
 # Empty matrix result
 # =============================================================================
 
+
 def _svd_empty_result(input, some=True, compute_uv=True):
     device = input.device
     dtype = input.dtype
@@ -1805,6 +1815,7 @@ def _svd_empty_result(input, some=True, compute_uv=True):
 # =============================================================================
 # Main reduced SVD routing
 # =============================================================================
+
 
 def _svd_triton_reduced(A):
     b, m, n = _svd_dims(A)
@@ -1843,6 +1854,7 @@ def _svdvals_triton(A):
 # =============================================================================
 # Public API: torch.svd style
 # =============================================================================
+
 
 def svd(input, some=True, compute_uv=True):
     logger.debug("GEMS SVD pure Triton optimized")
@@ -1893,3 +1905,4 @@ def svd(input, some=True, compute_uv=True):
         V = V.reshape(*outer_shape, *V.shape[-2:])
 
     return U, S, V
+    

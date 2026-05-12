@@ -30,6 +30,7 @@ def _reconstruct(u, s, v):
 # 2D shapes — all some × compute_uv combos
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", SHAPES_2D)
 @pytest.mark.parametrize("some", SOME_VALUES)
@@ -57,6 +58,7 @@ def test_svd_2d(shape, some, compute_uv):
 # 3D / 4D batched
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", SHAPES_3D + SHAPES_4D)
 @pytest.mark.parametrize("some", SOME_VALUES)
@@ -79,6 +81,7 @@ def test_svd_batched(shape, some, compute_uv):
 # Empty
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", SHAPES_EMPTY)
 def test_svd_empty(shape):
@@ -97,6 +100,7 @@ def test_svd_empty(shape):
 # ---------------------------------------------------------------------------
 # Special matrices
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.svd
 @pytest.mark.parametrize("n", [3, 8, 16])
@@ -120,6 +124,7 @@ def test_svd_special_matrices(n, mat_type):
 # ---------------------------------------------------------------------------
 # Non-contiguous
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.svd
 @pytest.mark.parametrize("shape", [(8, 5), (3, 16, 8)])

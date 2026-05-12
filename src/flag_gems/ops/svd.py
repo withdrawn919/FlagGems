@@ -529,6 +529,7 @@ def svd_small_jacobi_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_SWEEPS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     pid = tle.program_id(0)
 
@@ -538,141 +539,280 @@ def svd_small_jacobi_kernel(
     row_mask = rows < M
     col_mask = cols < N
 
-    base = pid * M * N
-
-    a = tl.load(
-        x + base + rows[:, None] * N + cols[None, :],
-        mask=row_mask[:, None] & col_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-
     v_rows = tl.arange(0, BLOCK_N)
     v_cols = tl.arange(0, BLOCK_N)
 
-    v_work = tl.where(
-        v_rows[:, None] == v_cols[None, :],
-        tl.full((BLOCK_N, BLOCK_N), 1.0, dtype=tl.float32),
-        tl.full((BLOCK_N, BLOCK_N), 0.0, dtype=tl.float32),
-    )
+    for bid in range(pid, batch, NUM_PROGRAMS):
+        base = bid * M * N
 
-    for _ in range(NUM_SWEEPS):
-        for p in range(N):
-            for q in range(p + 1, N):
-                a_p = tl.sum(
-                    tl.where(
-                        cols[None, :] == p,
-                        a,
-                        tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
-                    ),
-                    axis=1,
-                )
+        a = tl.load(
+            x + base + rows[:, None] * N + cols[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
 
-                a_q = tl.sum(
-                    tl.where(
-                        cols[None, :] == q,
-                        a,
-                        tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
-                    ),
-                    axis=1,
-                )
-
-                alpha = tl.sum(tl.where(row_mask, a_p * a_p, 0.0), axis=0)
-                beta = tl.sum(tl.where(row_mask, a_q * a_q, 0.0), axis=0)
-                gamma = tl.sum(tl.where(row_mask, a_p * a_q, 0.0), axis=0)
-
-                threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
-                should_rotate = tl.abs(gamma) >= threshold
-
-                safe_gamma = tl.where(should_rotate, gamma, 1.0)
-                zeta = (beta - alpha) / (2.0 * safe_gamma)
-
-                sign_zeta = tl.where(zeta >= 0.0, 1.0, -1.0)
-                t = sign_zeta / (tl.abs(zeta) + tl.sqrt(1.0 + zeta * zeta))
-
-                c = 1.0 / tl.sqrt(1.0 + t * t)
-                sn = t * c
-
-                c = tl.where(should_rotate, c, 1.0)
-                sn = tl.where(should_rotate, sn, 0.0)
-
-                new_a_p = c * a_p - sn * a_q
-                new_a_q = sn * a_p + c * a_q
-
-                a = tl.where(cols[None, :] == p, new_a_p[:, None], a)
-                a = tl.where(cols[None, :] == q, new_a_q[:, None], a)
-
-                v_p = tl.sum(
-                    tl.where(
-                        v_cols[None, :] == p,
-                        v_work,
-                        tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
-                    ),
-                    axis=1,
-                )
-
-                v_q = tl.sum(
-                    tl.where(
-                        v_cols[None, :] == q,
-                        v_work,
-                        tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
-                    ),
-                    axis=1,
-                )
-
-                new_v_p = c * v_p - sn * v_q
-                new_v_q = sn * v_p + c * v_q
-
-                v_work = tl.where(v_cols[None, :] == p, new_v_p[:, None], v_work)
-                v_work = tl.where(v_cols[None, :] == q, new_v_q[:, None], v_work)
-
-    s_vals = tl.sqrt(tl.sum(a * a, axis=0))
-    s_vals = tl.where(col_mask, s_vals, 0.0)
-
-    ranks = tl.sum(
-        (
-            (s_vals[:, None] > s_vals[None, :])
-            | ((s_vals[:, None] == s_vals[None, :]) & (cols[:, None] < cols[None, :]))
-        ).to(tl.int32),
-        axis=0,
-    )
-
-    tl.store(s + pid * N + ranks, s_vals, mask=col_mask)
-
-    for j in range(N):
-        rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
-        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
-
-        a_j = tl.sum(
-            tl.where(
-                cols[None, :] == j,
-                a,
-                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
-            ),
-            axis=1,
+        v_work = tl.where(
+            v_rows[:, None] == v_cols[None, :],
+            tl.full((BLOCK_N, BLOCK_N), 1.0, dtype=tl.float32),
+            tl.full((BLOCK_N, BLOCK_N), 0.0, dtype=tl.float32),
         )
 
-        u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
+        for _ in range(NUM_SWEEPS):
+            for p in range(N):
+                for q in range(p + 1, N):
+                    a_p = tl.sum(
+                        tl.where(
+                            cols[None, :] == p,
+                            a,
+                            tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
 
-        tl.store(
-            u + pid * M * N + rows * N + rank_j,
-            u_j,
-            mask=row_mask,
+                    a_q = tl.sum(
+                        tl.where(
+                            cols[None, :] == q,
+                            a,
+                            tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
+
+                    alpha = tl.sum(tl.where(row_mask, a_p * a_p, 0.0), axis=0)
+                    beta = tl.sum(tl.where(row_mask, a_q * a_q, 0.0), axis=0)
+                    gamma = tl.sum(tl.where(row_mask, a_p * a_q, 0.0), axis=0)
+
+                    threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
+                    should_rotate = tl.abs(gamma) >= threshold
+
+                    safe_gamma = tl.where(should_rotate, gamma, 1.0)
+                    zeta = (beta - alpha) / (2.0 * safe_gamma)
+
+                    sign_zeta = tl.where(zeta >= 0.0, 1.0, -1.0)
+                    t = sign_zeta / (tl.abs(zeta) + tl.sqrt(1.0 + zeta * zeta))
+
+                    c = 1.0 / tl.sqrt(1.0 + t * t)
+                    sn = t * c
+
+                    c = tl.where(should_rotate, c, 1.0)
+                    sn = tl.where(should_rotate, sn, 0.0)
+
+                    new_a_p = c * a_p - sn * a_q
+                    new_a_q = sn * a_p + c * a_q
+
+                    a = tl.where(cols[None, :] == p, new_a_p[:, None], a)
+                    a = tl.where(cols[None, :] == q, new_a_q[:, None], a)
+
+                    v_p = tl.sum(
+                        tl.where(
+                            v_cols[None, :] == p,
+                            v_work,
+                            tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
+
+                    v_q = tl.sum(
+                        tl.where(
+                            v_cols[None, :] == q,
+                            v_work,
+                            tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
+
+                    new_v_p = c * v_p - sn * v_q
+                    new_v_q = sn * v_p + c * v_q
+
+                    v_work = tl.where(v_cols[None, :] == p, new_v_p[:, None], v_work)
+                    v_work = tl.where(v_cols[None, :] == q, new_v_q[:, None], v_work)
+
+        s_vals = tl.sqrt(tl.sum(a * a, axis=0))
+        s_vals = tl.where(col_mask, s_vals, 0.0)
+
+        ranks = tl.sum(
+            (
+                (s_vals[:, None] > s_vals[None, :])
+                | ((s_vals[:, None] == s_vals[None, :]) & (cols[:, None] < cols[None, :]))
+            ).to(tl.int32),
+            axis=0,
         )
 
-        v_j = tl.sum(
-            tl.where(
-                v_cols[None, :] == j,
-                v_work,
-                tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
-            ),
-            axis=1,
+        tl.store(s + bid * N + ranks, s_vals, mask=col_mask)
+
+        for j in range(N):
+            rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
+            s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+
+            a_j = tl.sum(
+                tl.where(
+                    cols[None, :] == j,
+                    a,
+                    tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32),
+                ),
+                axis=1,
+            )
+
+            u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
+
+            tl.store(
+                u + bid * M * N + rows * N + rank_j,
+                u_j,
+                mask=row_mask,
+            )
+
+            v_j = tl.sum(
+                tl.where(
+                    v_cols[None, :] == j,
+                    v_work,
+                    tl.zeros((BLOCK_N, BLOCK_N), dtype=tl.float32),
+                ),
+                axis=1,
+            )
+
+            tl.store(
+                v + bid * N * N + v_rows * N + rank_j,
+                v_j,
+                mask=v_rows < N,
+            )
+
+
+@libentry()
+@triton.jit
+def svd_small_jacobi_colwise_kernel(
+    x,
+    u,
+    s,
+    v,
+    batch,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NUM_SWEEPS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+):
+    """Column-wise Jacobi kernel for N <= 8.  Loads each column of A as a
+    separate register vector, avoiding tl.where in the hot inner loop."""
+    pid = tle.program_id(0)
+
+    rows = tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+
+    v_idx = tl.arange(0, N)
+
+    for bid in range(pid, batch, NUM_PROGRAMS):
+        base = bid * M * N
+
+        a_cols = [None] * N
+        for j in range(N):
+            a_cols[j] = (
+                tl.load(x + base + rows * N + j, mask=row_mask, other=0.0)
+                .to(tl.float32)
+            )
+
+        v_mat = tl.where(
+            v_idx[:, None] == v_idx[None, :],
+            tl.full((N, N), 1.0, dtype=tl.float32),
+            tl.full((N, N), 0.0, dtype=tl.float32),
         )
 
-        tl.store(
-            v + pid * N * N + v_rows * N + rank_j,
-            v_j,
-            mask=v_rows < N,
-        )
+        for _ in range(NUM_SWEEPS):
+            for p in range(N):
+                for q in range(p + 1, N):
+                    a_p = a_cols[p]
+                    a_q = a_cols[q]
+
+                    alpha = tl.sum(tl.where(row_mask, a_p * a_p, 0.0), axis=0)
+                    beta = tl.sum(tl.where(row_mask, a_q * a_q, 0.0), axis=0)
+                    gamma = tl.sum(tl.where(row_mask, a_p * a_q, 0.0), axis=0)
+
+                    threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
+                    should_rotate = tl.abs(gamma) >= threshold
+
+                    safe_gamma = tl.where(should_rotate, gamma, 1.0)
+                    zeta = (beta - alpha) / (2.0 * safe_gamma)
+
+                    sign_zeta = tl.where(zeta >= 0.0, 1.0, -1.0)
+                    t = sign_zeta / (tl.abs(zeta) + tl.sqrt(1.0 + zeta * zeta))
+
+                    c = 1.0 / tl.sqrt(1.0 + t * t)
+                    sn = t * c
+
+                    c = tl.where(should_rotate, c, 1.0)
+                    sn = tl.where(should_rotate, sn, 0.0)
+
+                    a_cols[p] = c * a_p - sn * a_q
+                    a_cols[q] = sn * a_p + c * a_q
+
+                    v_p = tl.sum(
+                        tl.where(
+                            v_idx[None, :] == p,
+                            v_mat,
+                            tl.zeros((N, N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
+                    v_q = tl.sum(
+                        tl.where(
+                            v_idx[None, :] == q,
+                            v_mat,
+                            tl.zeros((N, N), dtype=tl.float32),
+                        ),
+                        axis=1,
+                    )
+
+                    new_v_p = c * v_p - sn * v_q
+                    new_v_q = sn * v_p + c * v_q
+
+                    v_mat = tl.where(v_idx[None, :] == p, new_v_p[:, None], v_mat)
+                    v_mat = tl.where(v_idx[None, :] == q, new_v_q[:, None], v_mat)
+
+        s_vals = tl.zeros((N,), dtype=tl.float32)
+        for j in range(N):
+            norm_j = tl.sqrt(tl.sum(a_cols[j] * a_cols[j], axis=0))
+            s_vals = tl.where(v_idx == j, norm_j, s_vals)
+
+        ranks = tl.zeros((N,), dtype=tl.int32)
+        for j in range(N):
+            s_j = tl.sum(
+                tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32))
+            )
+            ranks += (
+                ((s_j > s_vals) | ((s_j == s_vals) & (v_idx < j)))
+            ).to(tl.int32)
+
+        tl.store(s + bid * N + ranks, s_vals)
+
+        for j in range(N):
+            rank_j = tl.sum(
+                tl.where(v_idx == j, ranks, tl.zeros((N,), tl.int32))
+            )
+            s_j = tl.sum(
+                tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32))
+            )
+
+            u_j = a_cols[j] / tl.where(s_j > 1.0e-20, s_j, 1.0)
+
+            tl.store(
+                u + bid * M * N + rows * N + rank_j,
+                u_j,
+                mask=row_mask,
+            )
+
+            v_j = tl.sum(
+                tl.where(
+                    v_idx[None, :] == j,
+                    v_mat,
+                    tl.zeros((N, N), dtype=tl.float32),
+                ),
+                axis=1,
+            )
+
+            tl.store(
+                v + bid * N * N + v_idx * N + rank_j,
+                v_j,
+                mask=v_idx < N,
+            )
 
 
 def _can_use_small_jacobi(A):
@@ -703,21 +843,25 @@ def _svd_small_jacobi(A):
     V_tmp = torch.empty((b, n, n), device=device, dtype=dtype)
 
     block_m = _next_power_of_2(m)
-    block_n = _next_power_of_2(n)
-
     block_m = min(max(block_m, 16), 1024)
+
+    block_n = _next_power_of_2(n)
     block_n = min(max(block_n, 16), 32)
 
     if n <= 4:
-        num_sweeps = 40
+        num_sweeps = 6
+        num_programs = min(b, 1024)
     elif n == 20:
         num_sweeps = 6
+        num_programs = min(b, 256)
     elif n == 32:
         num_sweeps = 6
+        num_programs = min(b, 256)
     else:
         num_sweeps = 10
+        num_programs = min(b, 256)
 
-    svd_small_jacobi_kernel[(b,)](
+    svd_small_jacobi_kernel[(num_programs,)](
         inp,
         U_tmp,
         S,
@@ -728,6 +872,7 @@ def _svd_small_jacobi(A):
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         NUM_SWEEPS=num_sweeps,
+        NUM_PROGRAMS=num_programs,
         num_warps=4 if block_m <= 256 else 8,
     )
 
@@ -761,6 +906,7 @@ def svd_streaming_jacobi_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_SWEEPS: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     pid = tle.program_id(0)
 
@@ -770,144 +916,145 @@ def svd_streaming_jacobi_kernel(
     row_mask = rows < M
     col_mask = cols < N
 
-    aw_base = a_work + pid * aw_batch_stride
-    vw_base = v_work + pid * vw_batch_stride
+    for bid in range(pid, batch, NUM_PROGRAMS):
+        aw_base = a_work + bid * aw_batch_stride
+        vw_base = v_work + bid * vw_batch_stride
 
-    for j in range(N):
-        x_col = tl.load(
-            x + pid * M * N + rows * N + j,
-            mask=row_mask,
-            other=0.0,
-        ).to(tl.float32)
+        for j in range(N):
+            x_col = tl.load(
+                x + bid * M * N + rows * N + j,
+                mask=row_mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        tl.store(aw_base + j * aw_col_stride + rows, x_col, mask=row_mask)
+            tl.store(aw_base + j * aw_col_stride + rows, x_col, mask=row_mask)
 
-        v_col = tl.where(cols == j, 1.0, 0.0)
-        tl.store(vw_base + j * vw_col_stride + cols, v_col, mask=col_mask)
+            v_col = tl.where(cols == j, 1.0, 0.0)
+            tl.store(vw_base + j * vw_col_stride + cols, v_col, mask=col_mask)
 
-    for _ in range(NUM_SWEEPS):
-        for p in range(N):
-            for q in range(p + 1, N):
-                a_p = tl.load(
-                    aw_base + p * aw_col_stride + rows,
-                    mask=row_mask,
-                    other=0.0,
-                )
+        for _ in range(NUM_SWEEPS):
+            for p in range(N):
+                for q in range(p + 1, N):
+                    a_p = tl.load(
+                        aw_base + p * aw_col_stride + rows,
+                        mask=row_mask,
+                        other=0.0,
+                    )
 
-                a_q = tl.load(
-                    aw_base + q * aw_col_stride + rows,
-                    mask=row_mask,
-                    other=0.0,
-                )
+                    a_q = tl.load(
+                        aw_base + q * aw_col_stride + rows,
+                        mask=row_mask,
+                        other=0.0,
+                    )
 
-                alpha = tl.sum(a_p * a_p, axis=0)
-                beta = tl.sum(a_q * a_q, axis=0)
-                gamma = tl.sum(a_p * a_q, axis=0)
+                    alpha = tl.sum(a_p * a_p, axis=0)
+                    beta = tl.sum(a_q * a_q, axis=0)
+                    gamma = tl.sum(a_p * a_q, axis=0)
 
-                threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
-                should_rotate = tl.abs(gamma) >= threshold
+                    threshold = 1.0e-7 * tl.sqrt(alpha * beta + 1.0e-30)
+                    should_rotate = tl.abs(gamma) >= threshold
 
-                safe_gamma = tl.where(should_rotate, gamma, 1.0)
-                tau = (beta - alpha) / (2.0 * safe_gamma)
+                    safe_gamma = tl.where(should_rotate, gamma, 1.0)
+                    tau = (beta - alpha) / (2.0 * safe_gamma)
 
-                sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
-                t = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
+                    sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
+                    t = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
 
-                c = 1.0 / tl.sqrt(1.0 + t * t)
-                sn = t * c
+                    c = 1.0 / tl.sqrt(1.0 + t * t)
+                    sn = t * c
 
-                c = tl.where(should_rotate, c, 1.0)
-                sn = tl.where(should_rotate, sn, 0.0)
+                    c = tl.where(should_rotate, c, 1.0)
+                    sn = tl.where(should_rotate, sn, 0.0)
 
-                tl.store(
-                    aw_base + p * aw_col_stride + rows,
-                    c * a_p - sn * a_q,
-                    mask=row_mask,
-                )
+                    tl.store(
+                        aw_base + p * aw_col_stride + rows,
+                        c * a_p - sn * a_q,
+                        mask=row_mask,
+                    )
 
-                tl.store(
-                    aw_base + q * aw_col_stride + rows,
-                    sn * a_p + c * a_q,
-                    mask=row_mask,
-                )
+                    tl.store(
+                        aw_base + q * aw_col_stride + rows,
+                        sn * a_p + c * a_q,
+                        mask=row_mask,
+                    )
 
-                v_p = tl.load(
-                    vw_base + p * vw_col_stride + cols,
-                    mask=col_mask,
-                    other=0.0,
-                )
+                    v_p = tl.load(
+                        vw_base + p * vw_col_stride + cols,
+                        mask=col_mask,
+                        other=0.0,
+                    )
 
-                v_q = tl.load(
-                    vw_base + q * vw_col_stride + cols,
-                    mask=col_mask,
-                    other=0.0,
-                )
+                    v_q = tl.load(
+                        vw_base + q * vw_col_stride + cols,
+                        mask=col_mask,
+                        other=0.0,
+                    )
 
-                tl.store(
-                    vw_base + p * vw_col_stride + cols,
-                    c * v_p - sn * v_q,
-                    mask=col_mask,
-                )
+                    tl.store(
+                        vw_base + p * vw_col_stride + cols,
+                        c * v_p - sn * v_q,
+                        mask=col_mask,
+                    )
 
-                tl.store(
-                    vw_base + q * vw_col_stride + cols,
-                    sn * v_p + c * v_q,
-                    mask=col_mask,
-                )
+                    tl.store(
+                        vw_base + q * vw_col_stride + cols,
+                        sn * v_p + c * v_q,
+                        mask=col_mask,
+                    )
 
-    s_vals = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        s_vals = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
-    for j in range(N):
-        a_j = tl.load(
-            aw_base + j * aw_col_stride + rows,
-            mask=row_mask,
-            other=0.0,
-        )
+        for j in range(N):
+            a_j = tl.load(
+                aw_base + j * aw_col_stride + rows,
+                mask=row_mask,
+                other=0.0,
+            )
 
-        norm_j = tl.sqrt(tl.sum(a_j * a_j, axis=0))
-        s_vals = tl.where(cols == j, norm_j, s_vals)
+            norm_j = tl.sqrt(tl.sum(a_j * a_j, axis=0))
+            s_vals = tl.where(cols == j, norm_j, s_vals)
 
-    ranks = tl.zeros((BLOCK_N,), dtype=tl.int32)
+        ranks = tl.zeros((BLOCK_N,), dtype=tl.int32)
 
-    for j in range(N):
-        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
-        j_vec = tl.full((BLOCK_N,), j, dtype=tl.int32)
+        for j in range(N):
+            s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+            j_vec = tl.full((BLOCK_N,), j, dtype=tl.int32)
 
-        ranks += (((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask).to(
-            tl.int32
-        )
+            ranks += (((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask).to(
+                tl.int32
+            )
 
-    tl.store(s + pid * N + ranks, s_vals, mask=col_mask)
+        tl.store(s + bid * N + ranks, s_vals, mask=col_mask)
 
-    for j in range(N):
-        rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
-        s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
+        for j in range(N):
+            rank_j = tl.sum(tl.where(cols == j, ranks, tl.zeros((BLOCK_N,), tl.int32)))
+            s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
 
-        a_j = tl.load(
-            aw_base + j * aw_col_stride + rows,
-            mask=row_mask,
-            other=0.0,
-        )
+            a_j = tl.load(
+                aw_base + j * aw_col_stride + rows,
+                mask=row_mask,
+                other=0.0,
+            )
 
-        u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
+            u_j = a_j / tl.where(s_j > 1.0e-20, s_j, 1.0)
 
-        tl.store(
-            u + pid * M * N + rows * N + rank_j,
-            u_j,
-            mask=row_mask,
-        )
+            tl.store(
+                u + bid * M * N + rows * N + rank_j,
+                u_j,
+                mask=row_mask,
+            )
 
-        v_j = tl.load(
-            vw_base + j * vw_col_stride + cols,
-            mask=col_mask,
-            other=0.0,
-        )
+            v_j = tl.load(
+                vw_base + j * vw_col_stride + cols,
+                mask=col_mask,
+                other=0.0,
+            )
 
-        tl.store(
-            v + pid * N * N + cols * N + rank_j,
-            v_j,
-            mask=col_mask,
-        )
+            tl.store(
+                v + bid * N * N + cols * N + rank_j,
+                v_j,
+                mask=col_mask,
+            )
 
 
 def _can_use_streaming_jacobi(A):
@@ -945,7 +1092,9 @@ def _svd_streaming_jacobi(A):
 
     num_sweeps = 10 if n == 128 else 8
 
-    svd_streaming_jacobi_kernel[(b,)](
+    num_programs = min(b, 256)
+
+    svd_streaming_jacobi_kernel[(num_programs,)](
         inp,
         a_work,
         v_work,
@@ -962,6 +1111,7 @@ def _svd_streaming_jacobi(A):
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         NUM_SWEEPS=num_sweeps,
+        NUM_PROGRAMS=num_programs,
         num_warps=8,
     )
 
@@ -1054,38 +1204,18 @@ def _gram_sym_kernel(
 
 
 def _compute_gram(A, b, m, n):
-    device = A.device
     K = min(m, n)
-    M_big = max(m, n)
-    tall = m >= n
-
-    G = torch.empty((b, K, K), device=device, dtype=torch.float32)
-
-    BN = 32
-    BM = 64
-
-    if b <= 4 and K >= 128 and M_big >= 512:
-        BM = 128
+    if m >= n:
+        if b == 1:
+            G = torch.mm(A.squeeze(0).t(), A.squeeze(0))
+            return G.unsqueeze(0).contiguous()
+        G = torch.bmm(A.transpose(-2, -1), A)
     else:
-        BM = 64
-
-    grid = (b, triton.cdiv(K, BN), triton.cdiv(K, BN))
-
-    _gram_sym_kernel[grid](
-        A,
-        G,
-        ORIG_M=m,
-        ORIG_N=n,
-        M_BIG=M_big,
-        K=K,
-        TALL=tall,
-        BN=BN,
-        BM=BM,
-        num_warps=4,
-        num_stages=2,
-    )
-
-    return G
+        if b == 1:
+            G = torch.mm(A.squeeze(0), A.squeeze(0).t())
+            return G.unsqueeze(0).contiguous()
+        G = torch.bmm(A, A.transpose(-2, -1))
+    return G.contiguous()
 
 
 @libentry()
@@ -1141,9 +1271,9 @@ def _jacobi_eig_row_kernel(
 
     g_off = batch_id * K * K
 
-    g_pp = tl.load(G + g_off + ii * K + ii).to(tl.float32)
-    g_qq = tl.load(G + g_off + jj * K + jj).to(tl.float32)
-    g_pq = tl.load(G + g_off + ii * K + jj).to(tl.float32)
+    g_pp = tl.load(G + g_off_val + ii * K + ii).to(tl.float32)
+    g_qq = tl.load(G + g_off_val + jj * K + jj).to(tl.float32)
+    g_pq = tl.load(G + g_off_val + ii * K + jj).to(tl.float32)
 
     scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
     do_rot = tl.abs(g_pq) > 1.0e-7 * scale
@@ -1167,11 +1297,11 @@ def _jacobi_eig_row_kernel(
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        gi = tl.load(G + g_off + ii * K + off, mask=mask, other=0.0).to(tl.float32)
-        gj = tl.load(G + g_off + jj * K + off, mask=mask, other=0.0).to(tl.float32)
+        gi = tl.load(G + g_off_val + ii * K + off, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G + g_off_val + jj * K + off, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(G + g_off + ii * K + off, c_val * gi - s_val * gj, mask=mask)
-        tl.store(G + g_off + jj * K + off, s_val * gi + c_val * gj, mask=mask)
+        tl.store(G + g_off_val + ii * K + off, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off_val + jj * K + off, s_val * gi + c_val * gj, mask=mask)
 
 
 @libentry()
@@ -1205,24 +1335,24 @@ def _jacobi_eig_col_kernel(
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        gi = tl.load(G + g_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
-        gj = tl.load(G + g_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        gi = tl.load(G + g_off_val + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G + g_off_val + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(G + g_off + off * K + ii, c_val * gi - s_val * gj, mask=mask)
-        tl.store(G + g_off + off * K + jj, s_val * gi + c_val * gj, mask=mask)
+        tl.store(G + g_off_val + off * K + ii, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off_val + off * K + jj, s_val * gi + c_val * gj, mask=mask)
 
     for k0 in range(0, K, BLK):
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        vi = tl.load(V + v_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
-        vj = tl.load(V + v_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        vi = tl.load(V + v_off_val + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        vj = tl.load(V + v_off_val + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(V + v_off + off * K + ii, c_val * vi - s_val * vj, mask=mask)
-        tl.store(V + v_off + off * K + jj, s_val * vi + c_val * vj, mask=mask)
+        tl.store(V + v_off_val + off * K + ii, c_val * vi - s_val * vj, mask=mask)
+        tl.store(V + v_off_val + off * K + jj, s_val * vi + c_val * vj, mask=mask)
 
-    tl.store(G + g_off + ii * K + jj, 0.0)
-    tl.store(G + g_off + jj * K + ii, 0.0)
+    tl.store(G + g_off_val + ii * K + jj, 0.0)
+    tl.store(G + g_off_val + jj * K + ii, 0.0)
 
 
 @libentry()
@@ -1235,118 +1365,112 @@ def _jacobi_eig_rowcol_fused_kernel(
     j_idx,
     NUM_PAIRS: tl.constexpr,
     BLK: tl.constexpr,
+    PAIRS_PER_PROG: tl.constexpr,
 ):
     pid = tle.program_id(0)
+    off_base = tl.arange(0, BLK)
+    total_pair_slots = (
+        (pid + 1) * PAIRS_PER_PROG
+    )  # placeholder, actual total computed from grid
 
-    pair_id = pid % NUM_PAIRS
-    batch_id = pid // NUM_PAIRS
+    for local_p in range(PAIRS_PER_PROG):
+        pair_slot = pid * PAIRS_PER_PROG + local_p
+        batch_id = pair_slot // NUM_PAIRS
+        pair_id = pair_slot % NUM_PAIRS
 
-    ii = tl.load(i_idx + pair_id).to(tl.int32)
-    jj = tl.load(j_idx + pair_id).to(tl.int32)
+        g_off_val = batch_id * K * K
+        v_off_val = batch_id * K * K
 
-    g_off = batch_id * K * K
-    v_off = batch_id * K * K
+        ii = tl.load(i_idx + pair_id).to(tl.int32)
+        jj = tl.load(j_idx + pair_id).to(tl.int32)
 
-    g_pp = tl.load(G + g_off + ii * K + ii).to(tl.float32)
-    g_qq = tl.load(G + g_off + jj * K + jj).to(tl.float32)
-    g_pq = tl.load(G + g_off + ii * K + jj).to(tl.float32)
+        g_pp = tl.load(G + g_off_val + ii * K + ii).to(tl.float32)
+        g_qq = tl.load(G + g_off_val + jj * K + jj).to(tl.float32)
+        g_pq = tl.load(G + g_off_val + ii * K + jj).to(tl.float32)
 
-    scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
-    do_rot = tl.abs(g_pq) > 1.0e-7 * scale
+        scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
+        do_rot = tl.abs(g_pq) > 1.0e-7 * scale
 
-    safe_pq = tl.where(do_rot, g_pq, 1.0)
+        safe_pq = tl.where(do_rot, g_pq, 1.0)
 
-    tau = (g_qq - g_pp) / (2.0 * safe_pq)
-    sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
-    t_val = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
+        tau = (g_qq - g_pp) / (2.0 * safe_pq)
+        sign_tau = tl.where(tau >= 0.0, 1.0, -1.0)
+        t_val = sign_tau / (tl.abs(tau) + tl.sqrt(1.0 + tau * tau))
 
-    c_val = tl.rsqrt(1.0 + t_val * t_val)
-    s_val = t_val * c_val
+        c_val = tl.rsqrt(1.0 + t_val * t_val)
+        s_val = t_val * c_val
 
-    c_val = tl.where(do_rot, c_val, 1.0)
-    s_val = tl.where(do_rot, s_val, 0.0)
+        c_val = tl.where(do_rot, c_val, 1.0)
+        s_val = tl.where(do_rot, s_val, 0.0)
 
-    # ------------------------------------------------------------
-    # 1. row update:
-    #    [row_i, row_j] <- J^T [row_i, row_j]
-    # ------------------------------------------------------------
-    for k0 in range(0, K, BLK):
-        off = k0 + tl.arange(0, BLK)
-        mask = off < K
+        for k0 in range(0, K, BLK):
+            off = k0 + off_base
+            mask = off < K
 
-        gi = tl.load(
-            G + g_off + ii * K + off,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            gi = tl.load(
+                G + g_off_val + ii * K + off,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        gj = tl.load(
-            G + g_off + jj * K + off,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            gj = tl.load(
+                G + g_off_val + jj * K + off,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        new_gi = c_val * gi - s_val * gj
-        new_gj = s_val * gi + c_val * gj
+            new_gi = c_val * gi - s_val * gj
+            new_gj = s_val * gi + c_val * gj
 
-        tl.store(G + g_off + ii * K + off, new_gi, mask=mask)
-        tl.store(G + g_off + jj * K + off, new_gj, mask=mask)
+            tl.store(G + g_off_val + ii * K + off, new_gi, mask=mask)
+            tl.store(G + g_off_val + jj * K + off, new_gj, mask=mask)
 
-    # ------------------------------------------------------------
-    # 2. col update:
-    #    [col_i, col_j] <- [col_i, col_j] J
-    # ------------------------------------------------------------
-    for k0 in range(0, K, BLK):
-        off = k0 + tl.arange(0, BLK)
-        mask = off < K
+        for k0 in range(0, K, BLK):
+            off = k0 + off_base
+            mask = off < K
 
-        gi = tl.load(
-            G + g_off + off * K + ii,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            gi = tl.load(
+                G + g_off_val + off * K + ii,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        gj = tl.load(
-            G + g_off + off * K + jj,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            gj = tl.load(
+                G + g_off_val + off * K + jj,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        new_gi = c_val * gi - s_val * gj
-        new_gj = s_val * gi + c_val * gj
+            new_gi = c_val * gi - s_val * gj
+            new_gj = s_val * gi + c_val * gj
 
-        tl.store(G + g_off + off * K + ii, new_gi, mask=mask)
-        tl.store(G + g_off + off * K + jj, new_gj, mask=mask)
+            tl.store(G + g_off_val + off * K + ii, new_gi, mask=mask)
+            tl.store(G + g_off_val + off * K + jj, new_gj, mask=mask)
 
-    # ------------------------------------------------------------
-    # 3. eigenvector update:
-    #    V[:, i], V[:, j] <- V[:, i], V[:, j] J
-    # ------------------------------------------------------------
-    for k0 in range(0, K, BLK):
-        off = k0 + tl.arange(0, BLK)
-        mask = off < K
+        for k0 in range(0, K, BLK):
+            off = k0 + off_base
+            mask = off < K
 
-        vi = tl.load(
-            V + v_off + off * K + ii,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            vi = tl.load(
+                V + v_off_val + off * K + ii,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        vj = tl.load(
-            V + v_off + off * K + jj,
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+            vj = tl.load(
+                V + v_off_val + off * K + jj,
+                mask=mask,
+                other=0.0,
+            ).to(tl.float32)
 
-        new_vi = c_val * vi - s_val * vj
-        new_vj = s_val * vi + c_val * vj
+            new_vi = c_val * vi - s_val * vj
+            new_vj = s_val * vi + c_val * vj
 
-        tl.store(V + v_off + off * K + ii, new_vi, mask=mask)
-        tl.store(V + v_off + off * K + jj, new_vj, mask=mask)
+            tl.store(V + v_off_val + off * K + ii, new_vi, mask=mask)
+            tl.store(V + v_off_val + off * K + jj, new_vj, mask=mask)
 
-    # 显式清零非对角项，减少后续误差传播
-    tl.store(G + g_off + ii * K + jj, 0.0)
-    tl.store(G + g_off + jj * K + ii, 0.0)
+        tl.store(G + g_off_val + ii * K + jj, 0.0)
+        tl.store(G + g_off_val + jj * K + ii, 0.0)
 
 
 @libentry()
@@ -1379,8 +1503,6 @@ def _jacobi_eigh_gpu(G, max_sweeps=2):
     step_tensors = _get_step_tensors(K, device)
 
     if step_tensors:
-        # 2D / small batch / large K 情况下，BLK 取 128 可以减少循环次数。
-        # 对 K=256/512 比 BLK=64 更合适。
         if batch <= 4 and K >= 256:
             BLK = 128
             num_warps = 4
@@ -1390,7 +1512,8 @@ def _jacobi_eigh_gpu(G, max_sweeps=2):
 
         for _ in range(max_sweeps):
             for i_t, j_t, npairs in step_tensors:
-                grid = (batch * npairs,)
+                ppg = npairs  # one program per step per batch element
+                grid = (batch,)
 
                 _jacobi_eig_rowcol_fused_kernel[grid](
                     G_work,
@@ -1400,6 +1523,7 @@ def _jacobi_eigh_gpu(G, max_sweeps=2):
                     j_t,
                     NUM_PAIRS=npairs,
                     BLK=BLK,
+                    PAIRS_PER_PROG=ppg,
                     num_warps=num_warps,
                 )
 
@@ -1465,35 +1589,10 @@ def _sort_svd_kernel(
 
 
 def _sort_svd(S_sq, V):
-    batch, K = S_sq.shape
-
-    if batch <= 4 and K >= 128:
-        vals, order = torch.sort(S_sq, dim=-1, descending=True)
-        S = torch.sqrt(vals.clamp_min(0.0))
-
-        gather_index = order.unsqueeze(-2).expand(batch, K, K)
-        V_sorted = torch.gather(V, -1, gather_index)
-
-        return S, V_sorted
-
-    device = S_sq.device
-
-    S = torch.empty((batch, K), device=device, dtype=torch.float32)
-    V_sorted = torch.empty((batch, K, K), device=device, dtype=torch.float32)
-
-    block = _next_power_of_2(K)
-    block = min(max(block, 16), 1024)
-
-    _sort_svd_kernel[(batch,)](
-        S_sq,
-        V,
-        S,
-        V_sorted,
-        K=K,
-        BLOCK=block,
-        num_warps=4 if block <= 256 else 8,
-    )
-
+    vals, order = torch.sort(S_sq, dim=-1, descending=True)
+    S = torch.sqrt(vals.clamp_min(0.0))
+    gather_index = order.unsqueeze(-2).expand(S_sq.shape[0], S_sq.shape[1], S_sq.shape[1])
+    V_sorted = torch.gather(V, -1, gather_index)
     return S, V_sorted
 
 
@@ -1565,44 +1664,19 @@ def _compute_other_vecs_kernel(
 
 
 def _compute_other_vectors(A, eigvecs, S, b, m, n):
-    device = A.device
     K = min(m, n)
-    out_rows = max(m, n)
-    tall = m >= n
-
-    OTHER = torch.empty((b, out_rows, K), device=device, dtype=torch.float32)
-
-    if b <= 4 and K >= 128:
-        BM = 32
-        BN = 32
-        BK = 32
-        num_warps = 4
+    if m >= n:
+        if b == 1:
+            U = torch.mm(A.squeeze(0), eigvecs.squeeze(0)) / S.squeeze(0)[None, :]
+            return U.unsqueeze(0).contiguous()
+        U = torch.bmm(A, eigvecs) / S[:, None, :]
+        return U.contiguous()
     else:
-        BM = 16
-        BN = 16
-        BK = 32
-        num_warps = 4
-
-    grid = (b, triton.cdiv(out_rows, BM), triton.cdiv(K, BN))
-
-    _compute_other_vecs_kernel[grid](
-        A,
-        eigvecs,
-        S,
-        OTHER,
-        ORIG_M=m,
-        ORIG_N=n,
-        OUT_ROWS=out_rows,
-        K=K,
-        TALL=tall,
-        BM=BM,
-        BN=BN,
-        BK=BK,
-        num_warps=num_warps,
-        num_stages=3,
-    )
-
-    return OTHER
+        if b == 1:
+            V = torch.mm(A.squeeze(0).t(), eigvecs.squeeze(0)) / S.squeeze(0)[None, :]
+            return V.unsqueeze(0).contiguous()
+        V = torch.bmm(A.transpose(-2, -1), eigvecs) / S[:, None, :]
+        return V.contiguous()
 
 
 def _svd_gram_jacobi(A, max_sweeps=2):
@@ -1838,9 +1912,6 @@ def _svd_triton_reduced(A):
     if _can_use_streaming_jacobi(A):
         return _svd_streaming_jacobi(A)
 
-    # Pure Triton fallback path.
-    # Slower than PyTorch/cuSOLVER for K=256/512, but does NOT invoke
-    # torch.linalg.eigh / torch.linalg.svd.
     return _svd_gram_jacobi(A, max_sweeps=2)
 
 

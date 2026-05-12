@@ -633,7 +633,10 @@ def svd_small_jacobi_kernel(
         ranks = tl.sum(
             (
                 (s_vals[:, None] > s_vals[None, :])
-                | ((s_vals[:, None] == s_vals[None, :]) & (cols[:, None] < cols[None, :]))
+                | (
+                    (s_vals[:, None] == s_vals[None, :])
+                    & (cols[:, None] < cols[None, :])
+                )
             ).to(tl.int32),
             axis=0,
         )
@@ -705,9 +708,8 @@ def svd_small_jacobi_colwise_kernel(
 
         a_cols = [None] * N
         for j in range(N):
-            a_cols[j] = (
-                tl.load(x + base + rows * N + j, mask=row_mask, other=0.0)
-                .to(tl.float32)
+            a_cols[j] = tl.load(x + base + rows * N + j, mask=row_mask, other=0.0).to(
+                tl.float32
             )
 
         v_mat = tl.where(
@@ -774,22 +776,14 @@ def svd_small_jacobi_colwise_kernel(
 
         ranks = tl.zeros((N,), dtype=tl.int32)
         for j in range(N):
-            s_j = tl.sum(
-                tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32))
-            )
-            ranks += (
-                ((s_j > s_vals) | ((s_j == s_vals) & (v_idx < j)))
-            ).to(tl.int32)
+            s_j = tl.sum(tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32)))
+            ranks += (((s_j > s_vals) | ((s_j == s_vals) & (v_idx < j)))).to(tl.int32)
 
         tl.store(s + bid * N + ranks, s_vals)
 
         for j in range(N):
-            rank_j = tl.sum(
-                tl.where(v_idx == j, ranks, tl.zeros((N,), tl.int32))
-            )
-            s_j = tl.sum(
-                tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32))
-            )
+            rank_j = tl.sum(tl.where(v_idx == j, ranks, tl.zeros((N,), tl.int32)))
+            s_j = tl.sum(tl.where(v_idx == j, s_vals, tl.zeros((N,), tl.float32)))
 
             u_j = a_cols[j] / tl.where(s_j > 1.0e-20, s_j, 1.0)
 
@@ -1020,9 +1014,9 @@ def svd_streaming_jacobi_kernel(
             s_j = tl.sum(tl.where(cols == j, s_vals, tl.zeros((BLOCK_N,), tl.float32)))
             j_vec = tl.full((BLOCK_N,), j, dtype=tl.int32)
 
-            ranks += (((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask).to(
-                tl.int32
-            )
+            ranks += (
+                ((s_j > s_vals) | ((s_j == s_vals) & (j_vec < cols))) & col_mask
+            ).to(tl.int32)
 
         tl.store(s + bid * N + ranks, s_vals, mask=col_mask)
 
@@ -1204,7 +1198,6 @@ def _gram_sym_kernel(
 
 
 def _compute_gram(A, b, m, n):
-    K = min(m, n)
     if m >= n:
         if b == 1:
             G = torch.mm(A.squeeze(0).t(), A.squeeze(0))
@@ -1271,9 +1264,9 @@ def _jacobi_eig_row_kernel(
 
     g_off = batch_id * K * K
 
-    g_pp = tl.load(G + g_off_val + ii * K + ii).to(tl.float32)
-    g_qq = tl.load(G + g_off_val + jj * K + jj).to(tl.float32)
-    g_pq = tl.load(G + g_off_val + ii * K + jj).to(tl.float32)
+    g_pp = tl.load(G + g_off + ii * K + ii).to(tl.float32)
+    g_qq = tl.load(G + g_off + jj * K + jj).to(tl.float32)
+    g_pq = tl.load(G + g_off + ii * K + jj).to(tl.float32)
 
     scale = tl.sqrt(tl.maximum(tl.abs(g_pp * g_qq), 1.0e-30))
     do_rot = tl.abs(g_pq) > 1.0e-7 * scale
@@ -1297,11 +1290,11 @@ def _jacobi_eig_row_kernel(
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        gi = tl.load(G + g_off_val + ii * K + off, mask=mask, other=0.0).to(tl.float32)
-        gj = tl.load(G + g_off_val + jj * K + off, mask=mask, other=0.0).to(tl.float32)
+        gi = tl.load(G + g_off + ii * K + off, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G + g_off + jj * K + off, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(G + g_off_val + ii * K + off, c_val * gi - s_val * gj, mask=mask)
-        tl.store(G + g_off_val + jj * K + off, s_val * gi + c_val * gj, mask=mask)
+        tl.store(G + g_off + ii * K + off, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off + jj * K + off, s_val * gi + c_val * gj, mask=mask)
 
 
 @libentry()
@@ -1335,24 +1328,24 @@ def _jacobi_eig_col_kernel(
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        gi = tl.load(G + g_off_val + off * K + ii, mask=mask, other=0.0).to(tl.float32)
-        gj = tl.load(G + g_off_val + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        gi = tl.load(G + g_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        gj = tl.load(G + g_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(G + g_off_val + off * K + ii, c_val * gi - s_val * gj, mask=mask)
-        tl.store(G + g_off_val + off * K + jj, s_val * gi + c_val * gj, mask=mask)
+        tl.store(G + g_off + off * K + ii, c_val * gi - s_val * gj, mask=mask)
+        tl.store(G + g_off + off * K + jj, s_val * gi + c_val * gj, mask=mask)
 
     for k0 in range(0, K, BLK):
         off = k0 + tl.arange(0, BLK)
         mask = off < K
 
-        vi = tl.load(V + v_off_val + off * K + ii, mask=mask, other=0.0).to(tl.float32)
-        vj = tl.load(V + v_off_val + off * K + jj, mask=mask, other=0.0).to(tl.float32)
+        vi = tl.load(V + v_off + off * K + ii, mask=mask, other=0.0).to(tl.float32)
+        vj = tl.load(V + v_off + off * K + jj, mask=mask, other=0.0).to(tl.float32)
 
-        tl.store(V + v_off_val + off * K + ii, c_val * vi - s_val * vj, mask=mask)
-        tl.store(V + v_off_val + off * K + jj, s_val * vi + c_val * vj, mask=mask)
+        tl.store(V + v_off + off * K + ii, c_val * vi - s_val * vj, mask=mask)
+        tl.store(V + v_off + off * K + jj, s_val * vi + c_val * vj, mask=mask)
 
-    tl.store(G + g_off_val + ii * K + jj, 0.0)
-    tl.store(G + g_off_val + jj * K + ii, 0.0)
+    tl.store(G + g_off + ii * K + jj, 0.0)
+    tl.store(G + g_off + jj * K + ii, 0.0)
 
 
 @libentry()
@@ -1369,9 +1362,6 @@ def _jacobi_eig_rowcol_fused_kernel(
 ):
     pid = tle.program_id(0)
     off_base = tl.arange(0, BLK)
-    total_pair_slots = (
-        (pid + 1) * PAIRS_PER_PROG
-    )  # placeholder, actual total computed from grid
 
     for local_p in range(PAIRS_PER_PROG):
         pair_slot = pid * PAIRS_PER_PROG + local_p
@@ -1591,7 +1581,9 @@ def _sort_svd_kernel(
 def _sort_svd(S_sq, V):
     vals, order = torch.sort(S_sq, dim=-1, descending=True)
     S = torch.sqrt(vals.clamp_min(0.0))
-    gather_index = order.unsqueeze(-2).expand(S_sq.shape[0], S_sq.shape[1], S_sq.shape[1])
+    gather_index = order.unsqueeze(-2).expand(
+        S_sq.shape[0], S_sq.shape[1], S_sq.shape[1]
+    )
     V_sorted = torch.gather(V, -1, gather_index)
     return S, V_sorted
 
@@ -1664,7 +1656,6 @@ def _compute_other_vecs_kernel(
 
 
 def _compute_other_vectors(A, eigvecs, S, b, m, n):
-    K = min(m, n)
     if m >= n:
         if b == 1:
             U = torch.mm(A.squeeze(0), eigvecs.squeeze(0)) / S.squeeze(0)[None, :]

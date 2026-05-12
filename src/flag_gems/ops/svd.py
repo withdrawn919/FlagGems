@@ -1069,7 +1069,6 @@ def _compute_gram(A, b, m, n):
     else:
         BM = 64
         
-
     grid = (b, triton.cdiv(K, BN), triton.cdiv(K, BN))
 
     _gram_sym_kernel[grid](

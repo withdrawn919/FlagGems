@@ -975,6 +975,7 @@ def _svd_streaming_jacobi(A):
 # Pure Triton Gram + Jacobi eig fallback
 # =============================================================================
 
+
 @libentry()
 @triton.jit
 def _gram_sym_kernel(
@@ -1905,4 +1906,3 @@ def svd(input, some=True, compute_uv=True):
         V = V.reshape(*outer_shape, *V.shape[-2:])
 
     return U, S, V
-    

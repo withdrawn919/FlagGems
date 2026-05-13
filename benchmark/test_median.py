@@ -5,17 +5,6 @@ import torch
 
 from . import base, consts
 
-# Benchmark shapes organized by input dimension and size category
-BENCH_SHAPES = {
-    "1d": [(8,), (64,), (1024,), (4096,), (32768,)],
-    "2d_small": [(1, 1), (8, 8), (16, 32), (32, 64), (7, 13), (37, 99)],
-    "2d_regular": [(64, 64), (256, 128), (128, 256), (77, 233)],
-    "2d_large": [(1024, 1024), (1024, 2048), (333, 1333)],
-    "3d": [(8, 32, 64), (32, 128, 512), (16, 64, 1024), (11, 23, 47)],
-    "4d": [(2, 4, 8, 16), (4, 8, 16, 512), (4, 8, 16, 1024), (3, 5, 7, 11)],
-    "5d": [(2, 2, 4, 8, 16), (2, 4, 8, 16, 512), (2, 3, 5, 7, 13)],
-}
-
 
 class MedianBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
@@ -37,12 +26,6 @@ class MedianBenchmark(base.Benchmark):
                 continue
             filtered.append(shape)
         self.shapes = filtered
-
-    def set_more_shapes(self):
-        shapes = []
-        for cat in ["1d", "2d_small", "2d_regular", "2d_large", "3d", "4d", "5d"]:
-            shapes.extend(BENCH_SHAPES[cat])
-        return shapes
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -86,12 +69,6 @@ class MedianOutBenchmark(base.Benchmark):
                 continue
             filtered.append(shape)
         self.shapes = filtered
-
-    def set_more_shapes(self):
-        shapes = []
-        for cat in ["1d", "2d_small", "2d_regular", "3d"]:
-            shapes.extend(BENCH_SHAPES[cat])
-        return shapes
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -138,12 +115,6 @@ class MedianDimBenchmark(base.Benchmark):
                 continue
             filtered.append(shape)
         self.shapes = filtered
-
-    def set_more_shapes(self):
-        shapes = []
-        for cat in ["1d", "2d_small", "2d_regular", "2d_large", "3d", "4d", "5d"]:
-            shapes.extend(BENCH_SHAPES[cat])
-        return shapes
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -195,12 +166,6 @@ class MedianDimValuesBenchmark(base.Benchmark):
                 continue
             filtered.append(shape)
         self.shapes = filtered
-
-    def set_more_shapes(self):
-        shapes = []
-        for cat in ["1d", "2d_small", "2d_regular", "2d_large", "3d", "4d", "5d"]:
-            shapes.extend(BENCH_SHAPES[cat])
-        return shapes
 
     def get_gbps(self, args, latency):
         inp = args[0]

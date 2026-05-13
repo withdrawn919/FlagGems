@@ -457,3 +457,38 @@ ReshapeAndCacheFlashBenchmark:
     - [21, 4, 80, 16, 10000]
     - [42, 8, 64, 8, 1024]
     - [42, 8, 80, 16, 10000]
+
+median_shapes: &median_shapes
+  shapes:
+    - [64]
+    - [1024]
+    - [4096]
+    - [32768]
+    - [64, 64]
+    - [256, 128]
+    - [1024, 1024]
+    - [1024, 2048]
+    - [8, 32, 64]
+    - [32, 128, 512]
+    - [4, 8, 16, 512]
+    - [4, 8, 16, 1024]
+    - [2, 4, 8, 16, 512]
+  shape_desc: "(B), M, N"
+
+median:
+  <<: *median_shapes
+
+median_dim:
+  <<: *median_shapes
+
+median_dim_values:
+  <<: *median_shapes
+
+median_out:
+  shapes:
+    - [64]
+    - [1024]
+    - [64, 64]
+    - [256, 128]
+    - [8, 32, 64]
+  shape_desc: "(B), M, N"

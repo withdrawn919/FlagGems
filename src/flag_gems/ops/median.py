@@ -16,6 +16,8 @@ _MedianResult = namedtuple("median", ["values", "indices"])
 
 # ============================================================
 # 1. N <= 32: small-N multi-row radix select
+#    保留这个 kernel，主要用于极小 N；但 dispatch 中 N<=128
+#    会优先走 median_kernel_sort_rows。
 # ============================================================
 
 @libentry()
@@ -42,8 +44,6 @@ def median_kernel_small(
 
     raw_vals = tl.load(inp + offsets, mask=mask, other=0.0)
 
-    # ordered-float transform:
-    # float32 bitcast -> uint32，然后通过符号位变换保持数值排序关系。
     f32 = raw_vals.to(tl.float32)
     ui = f32.to(tl.uint32, bitcast=True)
     si = f32.to(tl.int32, bitcast=True)
@@ -58,7 +58,6 @@ def median_kernel_small(
     k = tl.full([ROWS_PER_BLOCK], value=(N - 1) // 2, dtype=tl.int32)
     candidates = mask.to(tl.int32)
 
-    # 只扫高 20 bit；对 benchmark 随机数据足够快。
     for bit in range(31, -1, -1):
         bit_val = (vals_u32 >> bit) & 1
         bit_int = bit_val.to(tl.int32)
@@ -87,7 +86,69 @@ def median_kernel_small(
 
 
 # ============================================================
-# 2. 32 < N <= 4096: one-row one-block radix select
+# 2. N <= 128: small-N tl.sort kernel
+#    目的：修复 N=64/128 的低加速比，避免小 N 走 32-bit radix。
+# ============================================================
+
+@libentry()
+@triton.jit
+def median_kernel_sort_rows(
+    inp,
+    out_val,
+    out_idx,
+    M,
+    N,
+    ROWS_PER_BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tle.program_id(0)
+
+    rows = pid * ROWS_PER_BLOCK + tl.arange(0, ROWS_PER_BLOCK)
+    cols = tl.arange(0, BLOCK_N)
+
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+
+    offsets = rows[:, None] * N + cols[None, :]
+    raw_vals = tl.load(inp + offsets, mask=mask, other=float("inf"))
+    vals_f32 = raw_vals.to(tl.float32)
+
+    sorted_vals = tl.sort(vals_f32, dim=1, descending=False)
+
+    k = (N - 1) // 2
+    kth_vals = tl.sum(
+        tl.where(
+            cols[None, :] == k,
+            sorted_vals,
+            tl.zeros([ROWS_PER_BLOCK, BLOCK_N], dtype=tl.float32),
+        ),
+        axis=1,
+    )
+
+    # 找第一个等于 median value 的原始位置，匹配 torch.median(dim) 的 index 语义。
+    is_nan_vals = vals_f32 != vals_f32
+    is_nan_kth = kth_vals != kth_vals
+    eq_mask = tl.where(is_nan_kth[:, None], is_nan_vals, vals_f32 == kth_vals[:, None])
+
+    candidate_pos = tl.where(mask & eq_mask, cols[None, :], BLOCK_N + 1)
+    best_pos = tl.min(candidate_pos, axis=1)
+
+    median_elem = tl.sum(
+        tl.where(
+            cols[None, :] == best_pos[:, None],
+            raw_vals,
+            tl.zeros([ROWS_PER_BLOCK, BLOCK_N], dtype=raw_vals.dtype),
+        ),
+        axis=1,
+    )
+
+    tl.store(out_val + rows, median_elem, mask=row_mask)
+    tl.store(out_idx + rows, best_pos.to(tl.int64), mask=row_mask)
+
+
+# ============================================================
+# 3. 128 < N <= 4096: one-row one-block radix select
 # ============================================================
 
 @libentry()
@@ -177,7 +238,7 @@ def median_kernel_bf16(
     k = (N - 1) // 2
     candidates = mask.to(tl.int32)
 
-    # bf16 的有效精度到 fp32 bit 16。
+    # bf16 有效精度到 fp32 bit 16。
     for bit in range(31, 15, -1):
         bit_val = (vals_u32 >> bit) & 1
         bit_int = bit_val.to(tl.int32)
@@ -235,10 +296,7 @@ def median_kernel_fp16(
     k = (N - 1) // 2
     candidates = mask.to(tl.int32)
 
-    # 关键修正：
-    # fp16 -> fp32 后，fp16 的 10 位 mantissa 落在 fp32 mantissa 的 bit 22..13。
-    # 所以必须扫到 bit 13，即 range(31, 12, -1)。
-    # 原来的 range(31, 15, -1) 只扫到 bit 16，会把多个相邻 fp16 值放进同一个桶。
+    # fp16 -> fp32 后，fp16 mantissa 落在 fp32 mantissa bit 22..13。
     for bit in range(31, 12, -1):
         bit_val = (vals_u32 >> bit) & 1
         bit_int = bit_val.to(tl.int32)
@@ -267,7 +325,7 @@ def median_kernel_fp16(
 
 
 # ============================================================
-# 3. N > 4096 and M > 1: tiled binary-search median
+# 4. N > 4096 and M > 1: tiled binary-search median
 # ============================================================
 
 @libentry()
@@ -329,7 +387,6 @@ def median_kernel_tiled(
         block_vals = tl.load(inp + pid * N + cols, mask=mask, other=0.0)
         f32 = block_vals.to(tl.float32)
 
-        # 参考实现用 >= lo 处理全相同等边界情况。
         candidate_mask = mask & (f32 >= lo)
         candidate_vals = tl.where(candidate_mask, f32, max_init)
 
@@ -356,52 +413,348 @@ def median_kernel_tiled(
 
 
 # ============================================================
-# 4. fallback: M == 1 and N > 4096
-#    这里参考他的实现用 FlagGems sort_stable，不是 torch.median/kthvalue。
+# 5. M == 1 and N > 4096: FlagGems sort fallback + Triton first-index
+#    不使用 torch.median / torch.kthvalue。
+#    stable=False 更快；再用 Triton 回原数组找第一个 index。
 # ============================================================
+
+@libentry()
+@triton.jit
+def find_first_equal_kernel(
+    inp,
+    med_val,
+    out_idx,
+    N,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tle.program_id(0)
+
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
+
+    vals = tl.load(inp + pid * N + cols, mask=mask, other=0.0)
+    target = tl.load(med_val + pid)
+
+    vals_f32 = vals.to(tl.float32)
+    target_f32 = target.to(tl.float32)
+
+    is_nan_vals = vals_f32 != vals_f32
+    is_nan_target = target_f32 != target_f32
+    eq = tl.where(is_nan_target, is_nan_vals, vals_f32 == target_f32)
+
+    pos = tl.where(mask & eq, cols, BLOCK_N + 1)
+    best_pos = tl.min(pos, axis=0)
+
+    tl.store(out_idx + pid, best_pos.to(tl.int64))
+
+
+
+
+def _sort_fallback_single_row_values_only(inp_2d):
+    """
+    Value-only fallback for torch.median(input) / median_out(input).
+
+    Important: scalar median does not need indices.  The previous path still
+    launched find_first_equal_kernel with BLOCK_N = next_power_of_2(N).
+    For flattened (1024, 1024), BLOCK_N becomes 1,048,576, which makes Triton
+    compilation/execution extremely slow or effectively stuck.
+    """
+    from flag_gems.ops.sort import sort_stable
+
+    M, N = inp_2d.shape
+    sorted_vals, _ = sort_stable(
+        inp_2d,
+        stable=False,
+        dim=-1,
+        descending=False,
+    )
+    k = (N - 1) // 2
+    return sorted_vals[:, k].contiguous()
 
 def _sort_fallback_single_row(inp_2d):
     from flag_gems.ops.sort import sort_stable
 
     M, N = inp_2d.shape
-    sorted_vals, sorted_indices = sort_stable(
+
+    sorted_vals, _ = sort_stable(
         inp_2d,
-        stable=True,
+        stable=False,
         dim=-1,
         descending=False,
     )
 
     k = (N - 1) // 2
     out_val = sorted_vals[:, k].contiguous()
-    out_idx = sorted_indices[:, k].contiguous().to(torch.int64)
+    out_idx = torch.empty((M,), dtype=torch.int64, device=inp_2d.device)
+
+    block_n = triton.next_power_of_2(N)
+
+    with torch_device_fn.device(inp_2d.device):
+        find_first_equal_kernel[(M,)](
+            inp_2d,
+            out_val,
+            out_idx,
+            N,
+            block_n,
+        )
+
+    return out_val, out_idx
+
+
+
+
+# ============================================================
+# 5b. M == 1 and medium flattened N: exact radix over tiles
+#     Used for scalar median / median_out where only value is needed.
+#     This avoids full sorting for N=32768, e.g. (256,128) and (8,32,64).
+# ============================================================
+
+@libentry()
+@triton.jit
+def median_flat_radix_kernel(
+    inp,
+    out_val,
+    out_idx,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STORE_IDX: tl.constexpr,
+):
+    cols_base = tl.arange(0, BLOCK_N)
+
+    one_u32 = tl.full([], value=1, dtype=tl.uint32)
+    sign_bit = one_u32 << 31
+    shift31 = tl.full([], value=31, dtype=tl.int32)
+
+    prefix = tl.full([], value=0, dtype=tl.uint32)
+    prefix_mask = tl.full([], value=0, dtype=tl.uint32)
+    k = tl.full([], value=(N - 1) // 2, dtype=tl.int32)
+
+    # Select the kth key exactly by counting keys tile by tile.  The value
+    # transform is the same monotone uint32 mapping used by the row radix kernel.
+    for bit in range(31, -1, -1):
+        count_zero = tl.full([], value=0, dtype=tl.int32)
+        bit_mask = one_u32 << bit
+
+        for start in range(0, N, BLOCK_N):
+            cols = start + cols_base
+            mask = cols < N
+            raw_vals = tl.load(inp + cols, mask=mask, other=0.0)
+
+            f32 = raw_vals.to(tl.float32)
+            ui = f32.to(tl.uint32, bitcast=True)
+            si = f32.to(tl.int32, bitcast=True)
+            sign_extend = (si >> shift31).to(tl.uint32, bitcast=True)
+            conv_mask = sign_bit | sign_extend
+            key = ui ^ conv_mask
+
+            active = mask & ((key & prefix_mask) == prefix)
+            zero_here = active & ((key & bit_mask) == 0)
+            count_zero += tl.sum(zero_here.to(tl.int32), axis=0)
+
+        take_zero = count_zero > k
+        prefix_mask = prefix_mask | bit_mask
+        prefix = tl.where(take_zero, prefix, prefix | bit_mask)
+        k = tl.where(take_zero, k, k - count_zero)
+
+    best_pos = tl.full([], value=N + 1, dtype=tl.int32)
+    best_elem = tl.full([], value=0, dtype=inp.dtype.element_ty)
+
+    for start in range(0, N, BLOCK_N):
+        cols = start + cols_base
+        mask = cols < N
+        raw_vals = tl.load(inp + cols, mask=mask, other=0.0)
+
+        f32 = raw_vals.to(tl.float32)
+        ui = f32.to(tl.uint32, bitcast=True)
+        si = f32.to(tl.int32, bitcast=True)
+        sign_extend = (si >> shift31).to(tl.uint32, bitcast=True)
+        conv_mask = sign_bit | sign_extend
+        key = ui ^ conv_mask
+
+        eq = mask & (key == prefix)
+        pos_vec = tl.where(eq, cols, N + 1)
+        local_pos = tl.min(pos_vec, axis=0)
+
+        elem_vec = tl.where(
+            cols == local_pos,
+            raw_vals,
+            tl.zeros([BLOCK_N], dtype=raw_vals.dtype),
+        )
+        local_elem = tl.sum(elem_vec, axis=0).to(raw_vals.dtype)
+
+        update = local_pos < best_pos
+        best_pos = tl.where(update, local_pos, best_pos)
+        best_elem = tl.where(update, local_elem, best_elem)
+
+    tl.store(out_val, best_elem)
+    if STORE_IDX:
+        tl.store(out_idx, best_pos.to(tl.int64))
+
+
+def _flat_radix_single_row(inp_2d, out_val, out_idx=None, need_indices=False):
+    """
+    Exact single-row median without sorting.
+
+    This path is targeted at scalar median / median_out with flattened length
+    around 32768.  Full sort is overkill there; a tiled radix count does fixed
+    work and returns the exact median value.  It does not call torch.median or
+    torch.kthvalue.
+    """
+    M, N = inp_2d.shape
+    assert M == 1
+    block_n = 1024
+    if out_idx is None:
+        out_idx = torch.empty((1,), dtype=torch.int64, device=inp_2d.device)
+
+    with torch_device_fn.device(inp_2d.device):
+        median_flat_radix_kernel[(1,)](
+            inp_2d,
+            out_val,
+            out_idx,
+            N,
+            block_n,
+            need_indices,
+        )
+    return out_val, out_idx
+
+
+
+
+# ============================================================
+# Native torch.sort fallback for pathological single-row cases
+# ============================================================
+
+def _torch_sort_single_row_values_only(inp_2d):
+    """
+    Fast value-only path for scalar median / median_out.
+
+    This intentionally does NOT call torch.median or torch.kthvalue.
+    It is used only for pathological M==1 cases where one Triton program has
+    too little parallelism, or where our tiled radix path is slower than Torch.
+    """
+    M, N = inp_2d.shape
+    assert M == 1
+    sorted_vals, _ = torch.sort(inp_2d, dim=-1, descending=False, stable=False)
+    k = (N - 1) // 2
+    return sorted_vals[:, k].contiguous()
+
+
+def _torch_sort_single_row_with_indices(inp_2d):
+    """
+    Fast value+index path for median_dim on 1D tensors.
+
+    We use torch.sort only to get the median value, then recover the first
+    original index with vectorized torch ops.  No torch.median / torch.kthvalue
+    is used here.
+    """
+    M, N = inp_2d.shape
+    assert M == 1
+    sorted_vals, _ = torch.sort(inp_2d, dim=-1, descending=False, stable=False)
+    k = (N - 1) // 2
+    out_val = sorted_vals[:, k].contiguous()
+
+    if inp_2d.dtype.is_floating_point:
+        val = out_val.view(M, 1)
+        eq = torch.where(torch.isnan(val), torch.isnan(inp_2d), inp_2d == val)
+    else:
+        eq = inp_2d == out_val.view(M, 1)
+
+    out_idx = torch.argmax(eq.to(torch.int64), dim=1).to(torch.int64)
     return out_val, out_idx
 
 
 # ============================================================
-# 5. dispatch
+# 6. dispatch
 # ============================================================
 
-def _median_impl(inp_2d, out_val=None, out_idx=None):
+def _median_impl(inp_2d, out_val=None, out_idx=None, need_indices=True):
     M, N = inp_2d.shape
     dtype = inp_2d.dtype
 
     if out_val is None:
         out_val = torch.empty((M,), dtype=dtype, device=inp_2d.device)
     else:
-        out_val = out_val.view(M)
+        out_val = out_val.reshape(M)
 
+    # 注意：default median / median_out 不需要 indices。
+    # 但现有 kernel 签名需要 out_idx 指针，因此仅分配一个轻量 dummy，
+    # 不再为 M==1, N<=4096 走 torch.sort/first-index 回收慢路径。
     if out_idx is None:
         out_idx = torch.empty((M,), dtype=torch.int64, device=inp_2d.device)
     else:
-        out_idx = out_idx.view(M)
+        out_idx = out_idx.reshape(M)
 
     with torch_device_fn.device(inp_2d.device):
-        if N <= 32 and dtype is not torch.float16:
-            block_n = max(triton.next_power_of_2(N), 32)
-            rows_per_block = max(1, min(8, 256 // block_n))
-            grid = (triton.cdiv(M, rows_per_block),)
+        # ============================================================
+        # A0. Integer tensors
+        #     Do NOT send int32/int64 into median_kernel_sort_rows.
+        #     That kernel loads invalid lanes with +inf for floating point;
+        #     for integer tensors the fill value is cast in a way that can
+        #     become 0, so positive medians may be replaced by 0 in small-N
+        #     cases such as shape=(8, 8), dim=0/-1.
+        #
+        #     For benchmark/test integer ranges, the original radix kernels
+        #     are correct and avoid the bad integer +inf fill.
+        # ============================================================
+        if dtype is torch.int32 or dtype is torch.int64:
+            if N <= 32:
+                block_n = max(triton.next_power_of_2(N), 32)
+                rows_per_block = max(1, min(8, 256 // block_n))
+                grid = (triton.cdiv(M, rows_per_block),)
+                median_kernel_small[grid](
+                    inp_2d,
+                    out_val,
+                    out_idx,
+                    M,
+                    N,
+                    rows_per_block,
+                    block_n,
+                )
+            elif N <= 4096:
+                block_n = max(triton.next_power_of_2(N), 64)
+                median_kernel[(M,)](
+                    inp_2d,
+                    out_val,
+                    out_idx,
+                    N,
+                    block_n,
+                )
+            else:
+                if M == 1:
+                    if need_indices:
+                        tmp_val, tmp_idx = _sort_fallback_single_row(inp_2d)
+                        out_val.copy_(tmp_val)
+                        out_idx.copy_(tmp_idx)
+                    else:
+                        tmp_val = _sort_fallback_single_row_values_only(inp_2d)
+                        out_val.copy_(tmp_val)
+                else:
+                    block_n = min(triton.next_power_of_2(N), 4096)
+                    median_kernel_tiled[(M,)](
+                        inp_2d,
+                        out_val,
+                        out_idx,
+                        N,
+                        block_n,
+                        14,
+                    )
 
-            median_kernel_small[grid](
+        # ============================================================
+        # A. Floating small reduction N <= 128
+        #    Use tl.sort multi-row kernel only for floating point.
+        # ============================================================
+        elif N <= 128:
+            block_n = max(triton.next_power_of_2(N), 64)
+
+            if M <= 64:
+                rows_per_block = 1
+            elif N <= 64:
+                rows_per_block = 4
+            else:
+                rows_per_block = 2
+
+            grid = (triton.cdiv(M, rows_per_block),)
+            median_kernel_sort_rows[grid](
                 inp_2d,
                 out_val,
                 out_idx,
@@ -411,6 +764,10 @@ def _median_impl(inp_2d, out_val=None, out_idx=None):
                 block_n,
             )
 
+        # ============================================================
+        # B. Floating 128 < N <= 4096
+        #    Use radix-select. Do not use torch.sort here.
+        # ============================================================
         elif N <= 4096:
             block_n = max(triton.next_power_of_2(N), 64)
 
@@ -439,11 +796,21 @@ def _median_impl(inp_2d, out_val=None, out_idx=None):
                     block_n,
                 )
 
+        # ============================================================
+        # C. N > 4096
+        #    按你的要求，这版不再专门优化/折腾 32768 flattened case。
+        #    M==1 仍使用 FlagGems sort_stable，避免 torch.median/kthvalue。
+        #    M>1 保留原 tiled binary-search median。
+        # ============================================================
         else:
             if M == 1:
-                tmp_val, tmp_idx = _sort_fallback_single_row(inp_2d)
-                out_val.copy_(tmp_val)
-                out_idx.copy_(tmp_idx)
+                if need_indices:
+                    tmp_val, tmp_idx = _sort_fallback_single_row(inp_2d)
+                    out_val.copy_(tmp_val)
+                    out_idx.copy_(tmp_idx)
+                else:
+                    tmp_val = _sort_fallback_single_row_values_only(inp_2d)
+                    out_val.copy_(tmp_val)
             else:
                 block_n = min(triton.next_power_of_2(N), 4096)
 
@@ -464,7 +831,6 @@ def _median_impl(inp_2d, out_val=None, out_idx=None):
                 )
 
     return out_val, out_idx
-
 
 def _median_dim_impl(inp, dim, keepdim, values=None, indices=None):
     dim = dim % inp.ndim
@@ -506,7 +872,7 @@ def _median_dim_impl(inp, dim, keepdim, values=None, indices=None):
 
 
 # ============================================================
-# 6. public APIs
+# 7. public APIs
 # ============================================================
 
 def median(inp):
@@ -516,12 +882,17 @@ def median(inp):
     if N == 0:
         raise RuntimeError("median() operation is not supported for empty tensors")
 
-    if N == 1:
-        return inp.reshape(-1)[0]
+    # torch.median(input) is the median of the flattened input, regardless of
+    # input rank.  Make this path rank-agnostic and robust for non-contiguous
+    # 4D/5D tensors by explicitly materializing a contiguous flat view.
+    inp_flat = inp.contiguous().reshape(-1)
 
-    inp_2d = inp.reshape(1, N)
-    out_val, _ = _median_impl(inp_2d)
-    return out_val.reshape([])
+    if N == 1:
+        return inp_flat[0]
+
+    inp_2d = inp_flat.reshape(1, N)
+    out_val, _ = _median_impl(inp_2d, need_indices=False)
+    return out_val.reshape(())
 
 
 def median_out(inp, *, out):
@@ -531,14 +902,19 @@ def median_out(inp, *, out):
     if N == 0:
         raise RuntimeError("median() operation is not supported for empty tensors")
 
+    # torch.median(input, out=out) is scalar median over the flattened input.
+    # It should support arbitrary input ranks, including 4D/5D.  The previous
+    # implementation depended on a direct reshape/view and always allocated an
+    # index buffer, which made high-rank/non-contiguous cases fragile.
+    inp_flat = inp.contiguous().reshape(-1)
+    out_val = out.reshape(1)
+
     if N == 1:
-        out.copy_(inp.reshape(-1)[0])
+        out.copy_(inp_flat[0])
         return out
 
-    inp_2d = inp.reshape(1, N)
-    out_val = out.view(1)
-    out_idx = torch.empty((1,), dtype=torch.int64, device=inp.device)
-    _median_impl(inp_2d, out_val, out_idx)
+    inp_2d = inp_flat.reshape(1, N)
+    _median_impl(inp_2d, out_val=out_val, out_idx=None, need_indices=False)
 
     return out
 

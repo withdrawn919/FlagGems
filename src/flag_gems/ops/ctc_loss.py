@@ -422,6 +422,7 @@ def _ctc_loss_init_grad_kernel(
     C: tl.constexpr,
     REDUCTION: tl.constexpr,
     ZERO_INFINITY: tl.constexpr,
+    FULL_LENGTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -429,7 +430,10 @@ def _ctc_loss_init_grad_kernel(
     batch = (offsets // C) % N
     t = offsets // (N * C)
 
-    input_len = tl.load(input_lengths + batch, mask=mask, other=0)
+    if FULL_LENGTH:
+        input_len = T
+    else:
+        input_len = tl.load(input_lengths + batch, mask=mask, other=0)
     target_len = tl.load(target_lengths + batch, mask=mask, other=1)
     nll = tl.load(neg_log_likelihood + batch, mask=mask, other=0.0).to(tl.float32)
 
@@ -484,12 +488,16 @@ def _ctc_loss_backward_kernel(
     TARGET_1D: tl.constexpr,
     REDUCTION: tl.constexpr,
     ZERO_INFINITY: tl.constexpr,
+    FULL_LENGTH: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     batch = tl.program_id(0)
     states = tl.arange(0, BLOCK_S)
 
-    input_len = tl.load(input_lengths + batch).to(tl.int32)
+    if FULL_LENGTH:
+        input_len = T
+    else:
+        input_len = tl.load(input_lengths + batch).to(tl.int32)
     target_len = tl.load(target_lengths + batch).to(tl.int32)
     nll = tl.load(neg_log_likelihood + batch).to(tl.float32)
     state_count = target_len * 2 + 1
@@ -552,8 +560,12 @@ def _ctc_loss_backward_kernel(
 
     for step in tl.range(0, T):
         t = input_len - 1 - step
-        active = t >= 0
-        safe_t = tl.where(active, t, 0)
+        if FULL_LENGTH:
+            active = True
+            safe_t = t
+        else:
+            active = t >= 0
+            safe_t = tl.where(active, t, 0)
         beta_base = scratch_batch + (step % 2) * STATE_COUNT_MAX
         next_beta_base = scratch_batch + ((step + 1) % 2) * STATE_COUNT_MAX
         beta = tl.load(beta_base + states, mask=stored_state, other=-float("inf")).to(
@@ -992,6 +1004,7 @@ class _CtcLossFunction(torch.autograd.Function):
         ctx.max_target = target_stride
         ctx.state_count_max = state_count_max
         ctx.target_1d = target_1d
+        ctx.full_length = full_length
 
         return output
 
@@ -1026,6 +1039,7 @@ class _CtcLossFunction(torch.autograd.Function):
                 work_log_probs.shape[2],
                 ctx.reduction,
                 ctx.zero_infinity,
+                ctx.full_length,
                 block,
             )
 
@@ -1055,7 +1069,9 @@ class _CtcLossFunction(torch.autograd.Function):
                 ctx.target_1d,
                 ctx.reduction,
                 ctx.zero_infinity,
+                ctx.full_length,
                 block_s,
+                num_warps=8,
             )
 
         if ctx.unbatched:
@@ -1288,6 +1304,7 @@ def _ctc_loss_backward_impl(
     total = work_log_probs.numel()
     block = 256
     block_s = triton.next_power_of_2(state_count_max) if state_count_max > 0 else 1
+    full_length = _cached_lengths_all_equal(work_input_lengths, T)
 
     with torch_device_fn.device(device):
         _ctc_loss_init_grad_kernel[(triton.cdiv(total, block),)](
@@ -1303,6 +1320,7 @@ def _ctc_loss_backward_impl(
             C,
             _REDUCTION_NONE,
             zero_infinity,
+            full_length,
             block,
         )
         scratch_beta = torch.empty(
@@ -1328,7 +1346,9 @@ def _ctc_loss_backward_impl(
             target_1d,
             _REDUCTION_NONE,
             zero_infinity,
+            full_length,
             block_s,
+            num_warps=8,
         )
 
     if grad_log_probs.dtype != log_probs.dtype:

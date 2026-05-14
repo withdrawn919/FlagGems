@@ -781,7 +781,7 @@ def test_ctc_loss_all_empty_targets(target_layout):
 @pytest.mark.parametrize("zero_infinity", [False, True])
 def test_ctc_loss_zero_input_length(target_len, zero_infinity):
     """Cover input_len == 0 with both empty and non-empty target."""
-    T, N, C, S = 3, 1, 5, 2
+    T, N, C = 3, 1, 5
     blank = 0
     log_probs = torch.randn(
         T, N, C, dtype=torch.float32, device=flag_gems.device, requires_grad=True

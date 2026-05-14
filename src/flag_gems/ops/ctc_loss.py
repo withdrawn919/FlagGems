@@ -281,8 +281,6 @@ def _ctc_loss_forward_scratch_kernel(
     tl.store(contrib + batch, loss)
 
 
-
-
 @libentry()
 @triton.jit
 def _ctc_loss_forward_reduce_serial_kernel(
@@ -339,9 +337,7 @@ def _ctc_loss_forward_reduce_serial_kernel(
             other=BLANK,
         )
         skip_allowed = (
-            (~is_blank_state)
-            & (target_index > 0)
-            & (target_value != prev_target_value)
+            (~is_blank_state) & (target_index > 0) & (target_value != prev_target_value)
         )
 
         init_state = (states == 0) | ((states == 1) & (target_len > 0))
@@ -358,7 +354,9 @@ def _ctc_loss_forward_reduce_serial_kernel(
         for t in tl.range(1, T):
             prev_base = scratch_alpha + ((t - 1) % 2) * STATE_COUNT_MAX
             cur_base = scratch_alpha + (t % 2) * STATE_COUNT_MAX
-            prev0 = tl.load(prev_base + states, mask=stored_state, other=-float("inf")).to(tl.float32)
+            prev0 = tl.load(
+                prev_base + states, mask=stored_state, other=-float("inf")
+            ).to(tl.float32)
             prev1 = tl.load(
                 prev_base + tl.where(states > 0, states - 1, 0),
                 mask=(states > 0) & stored_state,
@@ -931,7 +929,9 @@ class _CtcLossFunction(torch.autograd.Function):
                 output = contrib.squeeze(0) if unbatched else contrib
             else:
                 output = contrib.sum()
-            return output.to(original_dtype) if output.dtype != original_dtype else output
+            return (
+                output.to(original_dtype) if output.dtype != original_dtype else output
+            )
 
         raw_neg_log_likelihood = torch.empty(
             (batch_size,), dtype=torch.float32, device=log_probs.device

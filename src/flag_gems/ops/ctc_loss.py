@@ -1,4 +1,5 @@
 import logging
+import weakref
 
 import torch
 import triton
@@ -12,6 +13,8 @@ logger = logging.getLogger(__name__)
 _REDUCTION_NONE = 0
 _REDUCTION_MEAN = 1
 _REDUCTION_SUM = 2
+_LENGTHS_META_CACHE = {}
+_LENGTHS_META_CACHE_MAX_SIZE = 64
 
 
 @triton.jit
@@ -85,6 +88,15 @@ def _ctc_loss_forward_kernel(
 
     target_value = tl.load(target_ptrs, mask=target_mask, other=BLANK)
     labels = tl.where(is_blank_state, BLANK, target_value)
+    prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
+    prev_target_value = tl.load(
+        targets + target_origin + prev_target_index,
+        mask=target_mask & (target_index > 0),
+        other=BLANK,
+    )
+    skip_allowed = (
+        (~is_blank_state) & (target_index > 0) & (target_value != prev_target_value)
+    )
 
     t0_active = input_len > 0
     init_state = (states == 0) | ((states == 1) & (target_len > 0))
@@ -116,16 +128,6 @@ def _ctc_loss_forward_kernel(
             mask=(states > 1) & stored_state,
             other=-float("inf"),
         ).to(tl.float32)
-
-        prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
-        prev_target_value = tl.load(
-            targets + target_origin + prev_target_index,
-            mask=target_mask & (target_index > 0),
-            other=BLANK,
-        )
-        skip_allowed = (
-            (~is_blank_state) & (target_index > 0) & (target_value != prev_target_value)
-        )
 
         acc = _logaddexp3(prev0, prev1, prev2, skip_allowed)
 
@@ -168,6 +170,7 @@ def _ctc_loss_forward_kernel(
 def _ctc_loss_forward_scratch_kernel(
     log_probs,
     targets,
+    input_lengths,
     target_lengths,
     target_offsets,
     contrib,
@@ -180,11 +183,17 @@ def _ctc_loss_forward_scratch_kernel(
     BLANK: tl.constexpr,
     TARGET_1D: tl.constexpr,
     REDUCTION: tl.constexpr,
+    ZERO_INFINITY: tl.constexpr,
+    FULL_LENGTH: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     batch = tl.program_id(0)
     states = tl.arange(0, BLOCK_S)
 
+    if FULL_LENGTH:
+        input_len = T
+    else:
+        input_len = tl.load(input_lengths + batch)
     target_len = tl.load(target_lengths + batch)
     state_count = target_len * 2 + 1
     valid_state = states < state_count
@@ -204,14 +213,25 @@ def _ctc_loss_forward_scratch_kernel(
 
     target_value = tl.load(target_ptrs, mask=target_mask, other=BLANK)
     labels = tl.where(is_blank_state, BLANK, target_value)
+    prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
+    prev_target_value = tl.load(
+        targets + target_origin + prev_target_index,
+        mask=target_mask & (target_index > 0),
+        other=BLANK,
+    )
+    skip_allowed = (
+        (~is_blank_state) & (target_index > 0) & (target_value != prev_target_value)
+    )
 
     init_state = (states == 0) | ((states == 1) & (target_len > 0))
     init_logp = tl.load(
         log_probs + batch * C + labels,
-        mask=init_state & stored_state,
+        mask=init_state & stored_state & (input_len > 0),
         other=0.0,
     ).to(tl.float32)
-    alpha = tl.where(init_state & valid_state, init_logp, -float("inf"))
+    alpha = tl.where(
+        init_state & valid_state & (input_len > 0), init_logp, -float("inf")
+    )
     scratch_batch = scratch_alpha + batch * 2 * STATE_COUNT_MAX
     tl.store(scratch_batch + states, alpha, mask=stored_state)
 
@@ -232,29 +252,19 @@ def _ctc_loss_forward_scratch_kernel(
             other=-float("inf"),
         ).to(tl.float32)
 
-        prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
-        prev_target_value = tl.load(
-            targets + target_origin + prev_target_index,
-            mask=target_mask & (target_index > 0),
-            other=BLANK,
-        )
-        skip_allowed = (
-            (~is_blank_state) & (target_index > 0) & (target_value != prev_target_value)
-        )
-
         acc = _logaddexp3(prev0, prev1, prev2, skip_allowed)
         logp = tl.load(
             log_probs + t * N * C + batch * C + labels,
-            mask=valid_state,
+            mask=valid_state & (t < input_len),
             other=0.0,
         ).to(tl.float32)
-        alpha = tl.where(valid_state, acc + logp, -float("inf"))
+        alpha = tl.where(valid_state & (t < input_len), acc + logp, -float("inf"))
         tl.store(cur_base + states, alpha, mask=stored_state)
 
-    if T <= 0:
+    if input_len <= 0:
         loss = tl.where(target_len == 0, 0.0, float("inf"))
     else:
-        final_base = scratch_batch + ((T - 1) % 2) * STATE_COUNT_MAX
+        final_base = scratch_batch + ((input_len - 1) % 2) * STATE_COUNT_MAX
         last = tl.load(final_base + state_count - 1).to(tl.float32)
         prev_last = tl.load(
             final_base + tl.where(target_len > 0, state_count - 2, 0),
@@ -262,6 +272,9 @@ def _ctc_loss_forward_scratch_kernel(
             other=-float("inf"),
         ).to(tl.float32)
         loss = -_logaddexp(last, prev_last)
+
+    if ZERO_INFINITY:
+        loss = tl.where(loss == float("inf"), 0.0, loss)
 
     if REDUCTION == 1:
         loss = loss / tl.maximum(target_len, 1).to(tl.float32) / N
@@ -289,13 +302,17 @@ def _ctc_loss_forward_reduce_serial_kernel(
     TARGET_1D: tl.constexpr,
     REDUCTION: tl.constexpr,
     ZERO_INFINITY: tl.constexpr,
+    FULL_LENGTH: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
     states = tl.arange(0, BLOCK_S)
     total_loss = tl.full((), 0.0, tl.float32)
 
     for batch in tl.range(0, N):
-        input_len = tl.load(input_lengths + batch)
+        if FULL_LENGTH:
+            input_len = T
+        else:
+            input_len = tl.load(input_lengths + batch)
         target_len = tl.load(target_lengths + batch)
         state_count = target_len * 2 + 1
         valid_state = states < state_count
@@ -315,6 +332,17 @@ def _ctc_loss_forward_reduce_serial_kernel(
 
         target_value = tl.load(target_ptrs, mask=target_mask, other=BLANK)
         labels = tl.where(is_blank_state, BLANK, target_value)
+        prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
+        prev_target_value = tl.load(
+            targets + target_origin + prev_target_index,
+            mask=target_mask & (target_index > 0),
+            other=BLANK,
+        )
+        skip_allowed = (
+            (~is_blank_state)
+            & (target_index > 0)
+            & (target_value != prev_target_value)
+        )
 
         init_state = (states == 0) | ((states == 1) & (target_len > 0))
         init_logp = tl.load(
@@ -341,18 +369,6 @@ def _ctc_loss_forward_reduce_serial_kernel(
                 mask=(states > 1) & stored_state,
                 other=-float("inf"),
             ).to(tl.float32)
-
-            prev_target_index = tl.where(target_index > 0, target_index - 1, 0)
-            prev_target_value = tl.load(
-                targets + target_origin + prev_target_index,
-                mask=target_mask & (target_index > 0),
-                other=BLANK,
-            )
-            skip_allowed = (
-                (~is_blank_state)
-                & (target_index > 0)
-                & (target_value != prev_target_value)
-            )
 
             acc = _logaddexp3(prev0, prev1, prev2, skip_allowed)
             logp = tl.load(
@@ -647,102 +663,84 @@ def _lengths_to_tensor(lengths, device, name):
             raise RuntimeError(f"{name} must be integral")
     if out.dtype != torch.long:
         out = out.to(dtype=torch.long)
-    return out.reshape(1) if out.ndim == 0 else out.reshape(-1).contiguous()
+    if out.ndim == 0:
+        return out.reshape(1)
+    if out.ndim == 1:
+        return out if out.is_contiguous() else out.contiguous()
+    return out.reshape(-1).contiguous()
+
+
+def _lengths_cache_key(lengths, tag=None):
+    return (
+        tag,
+        lengths.device.type,
+        lengths.device.index,
+        lengths.dtype,
+        tuple(lengths.shape),
+        tuple(lengths.stride()),
+        id(lengths),
+        lengths.data_ptr(),
+        getattr(lengths, "_version", 0),
+    )
+
+
+def _get_cached_lengths_meta(lengths, key):
+    cached = _LENGTHS_META_CACHE.get(key)
+    if cached is None:
+        return None
+    lengths_ref, value = cached
+    if lengths_ref() is lengths:
+        return value
+    _LENGTHS_META_CACHE.pop(key, None)
+    return None
+
+
+def _set_cached_lengths_meta(lengths, key, value):
+    if len(_LENGTHS_META_CACHE) >= _LENGTHS_META_CACHE_MAX_SIZE:
+        _LENGTHS_META_CACHE.clear()
+    _LENGTHS_META_CACHE[key] = (weakref.ref(lengths), value)
+    return value
+
+
+def _cached_lengths_max(lengths):
+    key = _lengths_cache_key(lengths, "max")
+    cached = _get_cached_lengths_meta(lengths, key)
+    if cached is not None:
+        return cached
+    return _set_cached_lengths_meta(lengths, key, int(lengths.max().item()))
+
+
+def _cached_lengths_sum(lengths):
+    key = _lengths_cache_key(lengths, "sum")
+    cached = _get_cached_lengths_meta(lengths, key)
+    if cached is not None:
+        return cached
+    return _set_cached_lengths_meta(lengths, key, int(lengths.sum().item()))
+
+
+def _cached_lengths_all_equal(lengths, value):
+    key = _lengths_cache_key(lengths, ("all_eq", int(value)))
+    cached = _get_cached_lengths_meta(lengths, key)
+    if cached is not None:
+        return cached
+    return _set_cached_lengths_meta(
+        lengths, key, bool(torch.all(lengths == value).item())
+    )
+
+
+def _cached_target_offsets(target_lengths):
+    key = _lengths_cache_key(target_lengths, "offsets")
+    cached = _get_cached_lengths_meta(target_lengths, key)
+    if cached is not None:
+        return cached
+    offsets = (target_lengths.cumsum(0) - target_lengths).contiguous()
+    return _set_cached_lengths_meta(target_lengths, key, offsets)
 
 
 def _compute_dtype(dtype):
     if dtype in (torch.float16, torch.bfloat16):
         return torch.float32
     return dtype
-
-
-def _ctc_loss_forward_no_grad_torch_dp(
-    log_probs,
-    targets,
-    input_lengths,
-    target_lengths,
-    blank,
-    reduction,
-    zero_infinity,
-    target_1d,
-    unbatched,
-    original_dtype,
-):
-    """Pure PyTorch DP fallback for forward-only path with varying input lengths."""
-    device = log_probs.device
-    input_lengths_list = input_lengths.detach().cpu().tolist()
-    target_lengths_list = target_lengths.detach().cpu().tolist()
-
-    losses = []
-    target_offset = 0
-    for batch_idx, (input_len, target_len) in enumerate(
-        zip(input_lengths_list, target_lengths_list)
-    ):
-        if target_1d:
-            target = targets[target_offset : target_offset + target_len]
-            target_offset += target_len
-        else:
-            target = targets[batch_idx, :target_len]
-
-        if input_len == 0:
-            loss = torch.full((), float("inf"), dtype=torch.float32, device=device)
-            if target_len == 0:
-                loss = torch.zeros((), dtype=torch.float32, device=device)
-            losses.append(loss)
-            continue
-
-        state_count = target_len * 2 + 1
-        labels = torch.full((state_count,), blank, dtype=torch.long, device=device)
-        if target_len > 0:
-            labels[1::2] = target
-
-        alpha = torch.full(
-            (state_count,), -float("inf"), dtype=torch.float32, device=device
-        )
-        alpha[0] = log_probs[0, batch_idx, blank]
-        if target_len > 0:
-            alpha[1] = log_probs[0, batch_idx, target[0]]
-
-        skip_allowed = torch.zeros((state_count,), dtype=torch.bool, device=device)
-        if target_len > 1:
-            skip_allowed[3::2] = target[1:] != target[:-1]
-
-        for step in range(1, input_len):
-            prev1 = torch.full_like(alpha, -float("inf"))
-            prev1[1:] = alpha[:-1]
-            prev2 = torch.full_like(alpha, -float("inf"))
-            if state_count > 2:
-                prev2[2:] = alpha[:-2]
-            prev2 = torch.where(
-                skip_allowed, prev2, torch.full_like(alpha, -float("inf"))
-            )
-            alpha = torch.logaddexp(torch.logaddexp(alpha, prev1), prev2)
-            alpha = alpha + log_probs[step, batch_idx, labels]
-
-        if target_len > 0:
-            loss = -torch.logaddexp(alpha[-1], alpha[-2])
-        else:
-            loss = -alpha[-1]
-        losses.append(loss)
-
-    neg_log_likelihood = torch.stack(losses)
-    if zero_infinity:
-        neg_log_likelihood = torch.where(
-            torch.isinf(neg_log_likelihood),
-            torch.zeros((), dtype=neg_log_likelihood.dtype, device=device),
-            neg_log_likelihood,
-        )
-
-    if reduction == _REDUCTION_NONE:
-        output = neg_log_likelihood.squeeze(0) if unbatched else neg_log_likelihood
-    elif reduction == _REDUCTION_SUM:
-        output = neg_log_likelihood.sum()
-    else:
-        output = (neg_log_likelihood / target_lengths.clamp_min(1)).mean()
-
-    if output.dtype != original_dtype:
-        output = output.to(original_dtype)
-    return output
 
 
 # ============================================================================
@@ -811,7 +809,7 @@ class _CtcLossFunction(torch.autograd.Function):
                 f"but got {work_target_lengths.numel()}"
             )
 
-        max_target = int(work_target_lengths.max().item())
+        max_target = _cached_lengths_max(work_target_lengths)
         if max_target < 0:
             raise RuntimeError("ctc_loss target_lengths must be non-negative")
 
@@ -819,7 +817,7 @@ class _CtcLossFunction(torch.autograd.Function):
         target_stride = max_target
         if work_targets.ndim == 1:
             target_1d = True
-            total_target_length = int(work_target_lengths.sum().item())
+            total_target_length = _cached_lengths_sum(work_target_lengths)
             if total_target_length != work_targets.numel():
                 raise RuntimeError(
                     "ctc_loss expected concatenated targets length to equal "
@@ -839,37 +837,70 @@ class _CtcLossFunction(torch.autograd.Function):
             )
 
         if target_1d:
-            work_target_offsets = (
-                work_target_lengths.cumsum(0) - work_target_lengths
-            ).contiguous()
+            work_target_offsets = _cached_target_offsets(work_target_lengths)
         else:
             # Dummy tensor. Kernels only read it when TARGET_1D is true.
             work_target_offsets = work_target_lengths
 
         block_s = triton.next_power_of_2(state_count_max) if state_count_max > 0 else 1
         T = work_log_probs.shape[0]
+        full_length = _cached_lengths_all_equal(work_input_lengths, T)
 
-        # Benchmark critical path: forward-only + scalar reduction on small shapes.
-        # A single Triton program loops over the small batch and writes the final
-        # scalar directly, avoiding full alpha storage and an extra torch reduction.
-        if (
-            not needs_log_probs_grad
-            and reduction in (_REDUCTION_MEAN, _REDUCTION_SUM)
-            and batch_size <= 8
-            and T <= 128
-        ):
-            output_fp32 = torch.empty((), dtype=torch.float32, device=log_probs.device)
+        if not needs_log_probs_grad:
+            if (
+                reduction in (_REDUCTION_MEAN, _REDUCTION_SUM)
+                and batch_size <= 8
+                and T <= 128
+            ):
+                output_fp32 = torch.empty(
+                    (), dtype=torch.float32, device=log_probs.device
+                )
+                scratch_alpha = torch.empty(
+                    (2, state_count_max), dtype=torch.float32, device=log_probs.device
+                )
+                with torch_device_fn.device(log_probs.device):
+                    _ctc_loss_forward_reduce_serial_kernel[(1,)](
+                        work_log_probs,
+                        work_targets,
+                        work_input_lengths,
+                        work_target_lengths,
+                        work_target_offsets,
+                        output_fp32,
+                        scratch_alpha,
+                        T,
+                        batch_size,
+                        work_log_probs.shape[2],
+                        target_stride,
+                        state_count_max,
+                        blank,
+                        target_1d,
+                        reduction,
+                        zero_infinity,
+                        full_length,
+                        block_s,
+                    )
+                return (
+                    output_fp32.to(original_dtype)
+                    if output_fp32.dtype != original_dtype
+                    else output_fp32
+                )
+
+            contrib = torch.empty(
+                (batch_size,), dtype=torch.float32, device=log_probs.device
+            )
             scratch_alpha = torch.empty(
-                (2, state_count_max), dtype=torch.float32, device=log_probs.device
+                (batch_size, 2, state_count_max),
+                dtype=torch.float32,
+                device=log_probs.device,
             )
             with torch_device_fn.device(log_probs.device):
-                _ctc_loss_forward_reduce_serial_kernel[(1,)](
+                _ctc_loss_forward_scratch_kernel[(batch_size,)](
                     work_log_probs,
                     work_targets,
                     work_input_lengths,
                     work_target_lengths,
                     work_target_offsets,
-                    output_fp32,
+                    contrib,
                     scratch_alpha,
                     T,
                     batch_size,
@@ -880,9 +911,15 @@ class _CtcLossFunction(torch.autograd.Function):
                     target_1d,
                     reduction,
                     zero_infinity,
+                    full_length,
                     block_s,
                 )
-            return output_fp32.to(original_dtype) if output_fp32.dtype != original_dtype else output_fp32
+
+            if reduction == _REDUCTION_NONE:
+                output = contrib.squeeze(0) if unbatched else contrib
+            else:
+                output = contrib.sum()
+            return output.to(original_dtype) if output.dtype != original_dtype else output
 
         raw_neg_log_likelihood = torch.empty(
             (batch_size,), dtype=torch.float32, device=log_probs.device

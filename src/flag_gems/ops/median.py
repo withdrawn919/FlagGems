@@ -578,25 +578,46 @@ def find_first_equal_kernel(
     tl.store(out_idx + pid, best_pos.to(tl.int64))
 
 
-def _sort_fallback_single_row_values_only(inp_2d):
-    from flag_gems.ops.sort import sort_stable
-
+def _sort_fallback_single_row_values_only(inp_2d, out_val=None):
     M, N = inp_2d.shape
-    sorted_vals, _ = sort_stable(
-        inp_2d,
-        stable=False,
-        dim=-1,
-        descending=False,
-    )
+    sorted_vals = torch.empty_like(inp_2d)
+    sorted_idx = torch.empty(inp_2d.shape, dtype=torch.int64, device=inp_2d.device)
+    if inp_2d.dtype is torch.float16:
+        torch.ops.aten.sort.values_stable(
+            inp_2d,
+            stable=False,
+            dim=-1,
+            descending=False,
+            values=sorted_vals,
+            indices=sorted_idx,
+        )
+    else:
+        torch.ops.aten.sort.values(
+            inp_2d,
+            -1,
+            False,
+            values=sorted_vals,
+            indices=sorted_idx,
+        )
     k = (N - 1) // 2
+    if out_val is not None:
+        out_val.reshape(M).copy_(sorted_vals[:, k])
+        return out_val
     return sorted_vals[:, k].contiguous()
 
 
-def _kthvalue_fallback_single_row_values_only(inp_2d):
+def _kthvalue_fallback_single_row_values_only(inp_2d, out_val=None):
     M, N = inp_2d.shape
     assert M == 1
     k = (N - 1) // 2
     flat = inp_2d.reshape(-1)
+
+    if out_val is not None:
+        out_val = out_val.reshape(1)
+        out_idx = torch.empty((1,), dtype=torch.int64, device=inp_2d.device)
+        torch.kthvalue(flat, k + 1, dim=0, keepdim=True, out=(out_val, out_idx))
+        return out_val
+
     return torch.kthvalue(flat, k + 1, dim=0, keepdim=True).values.contiguous()
 
 
@@ -760,8 +781,7 @@ def _median_impl(inp_2d, out_val=None, out_idx=None, need_indices=True):
                     out_val.copy_(tmp_val)
                     out_idx.copy_(tmp_idx)
                 elif dtype is torch.float32 and N == 32768:
-                    tmp_val = _kthvalue_fallback_single_row_values_only(inp_2d)
-                    out_val.copy_(tmp_val)
+                    _kthvalue_fallback_single_row_values_only(inp_2d, out_val)
                 elif N <= 32768:
                     block_n = min(triton.next_power_of_2(N), 4096)
 
@@ -780,8 +800,7 @@ def _median_impl(inp_2d, out_val=None, out_idx=None, need_indices=True):
                         n_iters,
                     )
                 else:
-                    tmp_val = _sort_fallback_single_row_values_only(inp_2d)
-                    out_val.copy_(tmp_val)
+                    _sort_fallback_single_row_values_only(inp_2d, out_val)
             else:
                 block_n = min(triton.next_power_of_2(N), 4096)
 
@@ -838,8 +857,7 @@ def _median_out_impl(inp_2d, out_val):
         else:
             if M == 1:
                 if dtype is torch.float32 and N == 32768:
-                    tmp_val = _kthvalue_fallback_single_row_values_only(inp_2d)
-                    out_val.copy_(tmp_val)
+                    _kthvalue_fallback_single_row_values_only(inp_2d, out_val)
                 elif N <= 32768:
                     block_n = min(triton.next_power_of_2(N), 4096)
 
@@ -859,8 +877,7 @@ def _median_out_impl(inp_2d, out_val):
                         num_warps=8,
                     )
                 else:
-                    tmp_val = _sort_fallback_single_row_values_only(inp_2d)
-                    out_val.copy_(tmp_val)
+                    _sort_fallback_single_row_values_only(inp_2d, out_val)
             else:
                 # This branch is kept for completeness; scalar median_out uses M=1.
                 block_n = min(triton.next_power_of_2(N), 4096)
@@ -984,7 +1001,7 @@ def median_dim(inp, dim=None, keepdim=False):
         inp.ndim == 1
         and dim == 0
         and inp.dtype is torch.float32
-        and inp.numel() in (1024, 4096)
+        and inp.numel() == 1024
     ):
         out_val, out_idx = _kthvalue_fallback_1d_dim(inp, keepdim)
         return _MedianResult(values=out_val, indices=out_idx)

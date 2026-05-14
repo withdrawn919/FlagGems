@@ -1,31 +1,16 @@
-import math
+import os
 
 import pytest
 import torch
 
 from . import base, consts
 
+MEDIAN_SHAPE_FILE = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
+
 
 class MedianBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
-    MAX_N = 2**20
-    MAX_BITONIC_M = 256
-    MAX_TOTAL_ELEMS = 4 * 1024 * 1024
-
-    def set_shapes(self, shape_file_path=None):
-        super().set_shapes(shape_file_path)
-        filtered = []
-        for shape in self.shapes:
-            if any(dim >= self.MAX_N for dim in shape):
-                continue
-            N = shape[-1]
-            M = math.prod(shape[:-1]) if len(shape) > 1 else 1
-            if N <= 1024 and M > 16 * 1024:
-                continue
-            if math.prod(shape) > self.MAX_TOTAL_ELEMS:
-                continue
-            filtered.append(shape)
-        self.shapes = filtered
+    DEFAULT_SHAPE_FILES = MEDIAN_SHAPE_FILE
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -54,21 +39,7 @@ def test_median():
 # ===========================================================================
 class MedianOutBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
-    MAX_N = 2**20
-    # median_out flattens the input and falls back to kthvalue for N > 256,
-    # so cap total elements to stay within the bitonic-sort fast path.
-    MAX_TOTAL_ELEMS = 256 * 512
-
-    def set_shapes(self, shape_file_path=None):
-        super().set_shapes(shape_file_path)
-        filtered = []
-        for shape in self.shapes:
-            if any(dim >= self.MAX_N for dim in shape):
-                continue
-            if math.prod(shape) > self.MAX_TOTAL_ELEMS:
-                continue
-            filtered.append(shape)
-        self.shapes = filtered
+    DEFAULT_SHAPE_FILES = MEDIAN_SHAPE_FILE
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -97,24 +68,7 @@ def test_median_out_bench():
 # ===========================================================================
 class MedianDimBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
-    MAX_N = 2**20
-    MAX_BITONIC_M = 256
-    MAX_TOTAL_ELEMS = 4 * 1024 * 1024
-
-    def set_shapes(self, shape_file_path=None):
-        super().set_shapes(shape_file_path)
-        filtered = []
-        for shape in self.shapes:
-            if any(dim >= self.MAX_N for dim in shape):
-                continue
-            N = shape[-1]
-            M = math.prod(shape[:-1]) if len(shape) > 1 else 1
-            if N <= 1024 and M > 16 * 1024:
-                continue
-            if math.prod(shape) > self.MAX_TOTAL_ELEMS:
-                continue
-            filtered.append(shape)
-        self.shapes = filtered
+    DEFAULT_SHAPE_FILES = MEDIAN_SHAPE_FILE
 
     def get_gbps(self, args, latency):
         inp = args[0]
@@ -145,27 +99,7 @@ def test_median_dim_bench():
 # ===========================================================================
 class MedianDimValuesBenchmark(base.Benchmark):
     DEFAULT_METRICS = consts.DEFAULT_METRICS[:] + ["gbps"]
-    MAX_N = 2**20
-    MAX_BITONIC_M = 256
-    MAX_TOTAL_ELEMS = 4 * 1024 * 1024
-
-    def set_shapes(self, shape_file_path=None):
-        super().set_shapes(shape_file_path)
-        filtered = []
-        for shape in self.shapes:
-            if any(dim >= self.MAX_N for dim in shape):
-                continue
-            # 1D shapes with N > MAX_BITONIC_M fall back to kthvalue
-            if len(shape) == 1 and shape[0] > self.MAX_BITONIC_M:
-                continue
-            N = shape[-1]
-            M = math.prod(shape[:-1]) if len(shape) > 1 else 1
-            if N <= 1024 and M > 16 * 1024:
-                continue
-            if math.prod(shape) > self.MAX_TOTAL_ELEMS:
-                continue
-            filtered.append(shape)
-        self.shapes = filtered
+    DEFAULT_SHAPE_FILES = MEDIAN_SHAPE_FILE
 
     def get_gbps(self, args, latency):
         inp = args[0]

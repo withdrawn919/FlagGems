@@ -435,6 +435,22 @@ ConcatAndCacheMLABenchmark:
     - [64, 8, 21, 8, 4]
     - [512, 64, 42, 16, 8]
     - [1024, 64, 84, 16, 8]
+ctc_loss:
+  shapes:
+    - [64, 4, 32, 16]
+    - [256, 16, 64, 48]
+    - [512, 32, 64, 48]
+    - [1024, 32, 128, 96]
+  shape_desc: "T, N, C, S"
+
+ctc_loss_backward:
+  shapes:
+    - [64, 4, 32, 16]
+    - [256, 16, 64, 48]
+    - [512, 32, 64, 48]
+    - [1024, 32, 128, 96]
+  shape_desc: "T, N, C, S"
+
 PerTokenGroupQuantFp8Benchmark:
   shapes:
     - [7, 512, 512]

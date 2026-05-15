@@ -5,7 +5,7 @@ import flag_gems
 
 from . import base, consts
 
-CTC_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
+CTC_DTYPES = [torch.float32]
 
 
 def _make_targets(batch, max_target, classes, device, target_layout):

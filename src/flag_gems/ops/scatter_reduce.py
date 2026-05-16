@@ -6,7 +6,11 @@ import triton
 import triton.language as tl
 
 from flag_gems.utils import libentry
-from flag_gems.utils.shape_utils import MemOverlap, has_internal_overlapping, restride_dim
+from flag_gems.utils.shape_utils import (
+    MemOverlap,
+    has_internal_overlapping,
+    restride_dim,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +377,9 @@ def _scatter_reduce_impl(out, dim, index, src, reduce, include_self):
     if has_internal_overlapping(out) == MemOverlap.Yes:
         out = out.contiguous()
     if _can_use_lastdim_identity_fast_path(out, dim, index, src):
-        return _scatter_reduce_lastdim_identity(out, dim, index, src, reduce, include_self)
+        return _scatter_reduce_lastdim_identity(
+            out, dim, index, src, reduce, include_self
+        )
     if _can_use_runtime_kernel(out, dim, index, src, reduce, include_self):
         return _scatter_reduce_runtime(out, dim, index, src, reduce)
     return _scatter_reduce_python(out, dim, index, src, reduce, include_self)

@@ -7,7 +7,6 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-
 REDUCE_OPS = ["sum", "prod", "mean", "amax", "amin"]
 OVERLOADS = ["functional", "inplace", "out"]
 SHAPE_DIM_CASES = [
@@ -24,9 +23,7 @@ def _make_index(index_shape, inp_shape, dim, device):
     index = torch.empty(index_shape, dtype=torch.long, device=device)
     dim_values = torch.arange(index_shape[dim], dtype=torch.long, device=device)
     dim_values = dim_values % inp_shape[dim]
-    outer_ranges = [
-        range(size) for axis, size in enumerate(index_shape) if axis != dim
-    ]
+    outer_ranges = [range(size) for axis, size in enumerate(index_shape) if axis != dim]
 
     for outer_idx in itertools.product(*outer_ranges):
         slices = []
@@ -141,7 +138,9 @@ def test_scatter_reduce_overloads(dtype, reduce, include_self, overload):
 @pytest.mark.parametrize("src_shape, inp_shape, dim", SHAPE_DIM_CASES)
 @pytest.mark.parametrize("include_self", [True, False])
 @pytest.mark.parametrize("reduce", ["sum", "amax"])
-def test_scatter_reduce_shapes_and_dims(src_shape, inp_shape, dim, include_self, reduce):
+def test_scatter_reduce_shapes_and_dims(
+    src_shape, inp_shape, dim, include_self, reduce
+):
     dtype = torch.float32
     inp, index, src = _make_inputs(src_shape, inp_shape, dim, dtype)
 

@@ -409,6 +409,129 @@ def _conv_transpose2d_stride1_forward_kernel(
     tl.store(output_offsets, accum, mask=output_mask)
 
 
+@libentry()
+@triton.jit
+def _conv_transpose2d_stride2_3x3_forward_kernel(
+    input_pointer,
+    weight_pointer,
+    bias_pointer,
+    output_pointer,
+    in_n: tl.constexpr,
+    input_height: tl.constexpr,
+    input_width: tl.constexpr,
+    input_c: tl.constexpr,
+    out_c: tl.constexpr,
+    out_height: tl.constexpr,
+    out_width: tl.constexpr,
+    input_n_stride: tl.constexpr,
+    input_c_stride: tl.constexpr,
+    input_height_stride: tl.constexpr,
+    input_width_stride: tl.constexpr,
+    weight_i_stride: tl.constexpr,
+    weight_o_stride: tl.constexpr,
+    weight_height_stride: tl.constexpr,
+    weight_width_stride: tl.constexpr,
+    output_n_stride: tl.constexpr,
+    output_c_stride: tl.constexpr,
+    output_height_stride: tl.constexpr,
+    output_width_stride: tl.constexpr,
+    groups: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    PARITY_H: tl.constexpr,
+    PARITY_W: tl.constexpr,
+    KH_BASE: tl.constexpr,
+    KW_BASE: tl.constexpr,
+    KH_COUNT: tl.constexpr,
+    KW_COUNT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_CI: tl.constexpr,
+    BLOCK_CO: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_co = tl.program_id(1)
+    pid_group = tl.program_id(2)
+
+    out_per_group_c: tl.constexpr = out_c // groups
+    in_per_group_c: tl.constexpr = input_c // groups
+    out_height2: tl.constexpr = out_height // 2
+    out_width2: tl.constexpr = out_width // 2
+
+    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    n_oh2 = m_offsets // out_width2
+    n_offsets = n_oh2 // out_height2
+    oh2_offsets = n_oh2 - n_offsets * out_height2
+    ow2_offsets = m_offsets - n_oh2 * out_width2
+    oh_offsets = oh2_offsets * 2 + PARITY_H
+    ow_offsets = ow2_offsets * 2 + PARITY_W
+
+    co_offsets = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
+    accum = tl.zeros((BLOCK_M, BLOCK_CO), dtype=tl.float32)
+
+    input_pointer += (
+        input_n_stride * n_offsets + input_c_stride * pid_group * in_per_group_c
+    )[:, None]
+    weight_pointer += weight_i_stride * pid_group * in_per_group_c
+
+    for kh_idx in range(KH_COUNT):
+        kh = KH_BASE + kh_idx * 2
+        ih = (oh_offsets + 1 - kh) // 2
+        ih_valid = (0 <= ih) & (ih < input_height)
+        for kw_idx in range(KW_COUNT):
+            kw = KW_BASE + kw_idx * 2
+            iw = (ow_offsets + 1 - kw) // 2
+            spatial_mask = (
+                ih_valid & (0 <= iw) & (iw < input_width) & (n_offsets < in_n)
+            )
+
+            for ci_start in range(0, in_per_group_c, BLOCK_CI):
+                ci_offsets = ci_start + tl.arange(0, BLOCK_CI)
+                input_offsets = (
+                    input_pointer
+                    + (input_c_stride * ci_offsets)[None, :]
+                    + (input_height_stride * ih)[:, None]
+                    + (input_width_stride * iw)[:, None]
+                )
+                weight_offsets = (
+                    weight_pointer
+                    + (weight_i_stride * ci_offsets)[:, None]
+                    + (weight_o_stride * co_offsets)[None, :]
+                    + weight_height_stride * kh
+                    + weight_width_stride * kw
+                )
+                input_mask = (
+                    spatial_mask[:, None] & (ci_offsets < in_per_group_c)[None, :]
+                )
+                weight_mask = (ci_offsets < in_per_group_c)[:, None] & (
+                    co_offsets < out_per_group_c
+                )[None, :]
+                input_block = tl.load(input_offsets, mask=input_mask, other=0.0)
+                weight_block = tl.load(weight_offsets, mask=weight_mask, other=0.0)
+                accum += tl.dot(
+                    input_block, weight_block, input_precision=INPUT_PRECISION
+                )
+
+    if HAS_BIAS:
+        bias = tl.load(
+            bias_pointer + pid_group * out_per_group_c + co_offsets,
+            mask=co_offsets < out_per_group_c,
+            other=0.0,
+        ).to(tl.float32)
+        accum += bias[None, :]
+
+    output_offsets = (
+        output_pointer
+        + (output_n_stride * n_offsets)[:, None]
+        + (output_c_stride * (pid_group * out_per_group_c + co_offsets))[None, :]
+        + (output_height_stride * oh_offsets)[:, None]
+        + (output_width_stride * ow_offsets)[:, None]
+    )
+    output_mask = (m_offsets < in_n * out_height2 * out_width2)[:, None] & (
+        co_offsets < out_per_group_c
+    )[None, :]
+    tl.store(output_offsets, accum, mask=output_mask)
+
+
 def _can_use_triton_forward(
     input, weight, bias, stride, padding, output_padding, groups, dilation
 ):
@@ -1029,9 +1152,63 @@ def _conv_transpose2d_forward(
     if _can_use_stride2_kernel(
         stride, padding, dilation, out_height, out_width, weight
     ):
-        block_m = 128 if groups > 1 else 256
-        block_co = 32
-        num_warps = 4 if groups > 1 else 8
+        use_fp32_4x4_tile = input.dtype == torch.float32 and weight_height == 4
+        block_m = 128 if groups > 1 or use_fp32_4x4_tile else 256
+        block_co = 16 if groups > 1 else 32
+        num_warps = 4 if groups > 1 or use_fp32_4x4_tile else 8
+        if input.dtype == torch.float32 and weight_height == 3 and weight_width == 3:
+            parity_configs = (
+                (0, 0, 1, 1, 1, 1),
+                (0, 1, 1, 0, 1, 2),
+                (1, 0, 0, 1, 2, 1),
+                (1, 1, 0, 0, 2, 2),
+            )
+            grid = lambda META: (
+                triton.cdiv(
+                    in_n * (out_height // 2) * (out_width // 2), META["BLOCK_M"]
+                ),
+                triton.cdiv(out_per_group_c, META["BLOCK_CO"]),
+                groups,
+            )
+            for (
+                parity_h,
+                parity_w,
+                kh_base,
+                kw_base,
+                kh_count,
+                kw_count,
+            ) in parity_configs:
+                _conv_transpose2d_stride2_3x3_forward_kernel[grid](
+                    input,
+                    weight,
+                    input if bias is None else bias,
+                    output,
+                    in_n,
+                    input_height,
+                    input_width,
+                    input_c,
+                    out_c,
+                    out_height,
+                    out_width,
+                    *input.stride(),
+                    *weight.stride(),
+                    *output.stride(),
+                    groups,
+                    HAS_BIAS=bias is not None,
+                    PARITY_H=parity_h,
+                    PARITY_W=parity_w,
+                    KH_BASE=kh_base,
+                    KW_BASE=kw_base,
+                    KH_COUNT=kh_count,
+                    KW_COUNT=kw_count,
+                    BLOCK_M=block_m,
+                    BLOCK_CI=32,
+                    BLOCK_CO=block_co,
+                    INPUT_PRECISION=_dot_input_precision(input),
+                    num_warps=num_warps,
+                )
+            return output
+
         grid = lambda META: (
             triton.cdiv(in_n * (out_height // 2) * (out_width // 2), META["BLOCK_M"]),
             triton.cdiv(out_per_group_c, META["BLOCK_CO"]),
@@ -1140,6 +1317,7 @@ def _conv_transpose2d_backward(
             and weight_height == 3
             and weight_width == 3
             and stride == (2, 2)
+            and grad_output.dtype != torch.float32
         ):
             grad_input = conv2d(
                 grad_output,
@@ -1153,9 +1331,12 @@ def _conv_transpose2d_backward(
         else:
             grad_input = torch.empty_like(input)
             block_m = 128
-            block_co = (
-                64 if groups == 1 and weight_height == 4 and weight_width == 4 else 32
-            )
+            if groups > 1:
+                block_co = 16
+            elif weight_height == 4 and weight_width == 4:
+                block_co = 64
+            else:
+                block_co = 32
             grid = lambda META: (
                 triton.cdiv(in_n * input_height * input_width, META["BLOCK_M"]),
                 triton.cdiv(input_c // groups, META["BLOCK_CO"]),

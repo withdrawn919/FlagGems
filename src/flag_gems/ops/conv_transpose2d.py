@@ -128,9 +128,12 @@ def _conv_transpose2d_forward_kernel(
                 input_mask = (
                     spatial_mask[:, None] & (ci_offsets < in_per_group_c)[None, :]
                 )
-                weight_mask = (ci_offsets < in_per_group_c)[:, None] & (
-                    co_offsets < out_per_group_c
-                )[None, :]
+                weight_mask = (
+                    (kh < weight_height)
+                    & (kw < weight_width)
+                    & (ci_offsets < in_per_group_c)[:, None]
+                    & (co_offsets < out_per_group_c)[None, :]
+                )
 
                 input_block = tl.load(input_offsets, mask=input_mask, other=0.0)
                 weight_block = tl.load(weight_offsets, mask=weight_mask, other=0.0)
@@ -256,9 +259,12 @@ def _conv_transpose2d_stride2_forward_kernel(
                 input_mask = (
                     spatial_mask[:, None] & (ci_offsets < in_per_group_c)[None, :]
                 )
-                weight_mask = (ci_offsets < in_per_group_c)[:, None] & (
-                    co_offsets < out_per_group_c
-                )[None, :]
+                weight_mask = (
+                    (kh < weight_height)
+                    & (kw < weight_width)
+                    & (ci_offsets < in_per_group_c)[:, None]
+                    & (co_offsets < out_per_group_c)[None, :]
+                )
 
                 input_block = tl.load(input_offsets, mask=input_mask, other=0.0)
                 weight_block = tl.load(weight_offsets, mask=weight_mask, other=0.0)

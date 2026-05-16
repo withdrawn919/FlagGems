@@ -1,9 +1,28 @@
+import contextlib
+
 import pytest
 import torch
 
 import flag_gems
+from tests import accuracy_utils as utils
 
-from . import base, consts
+from . import base
+
+
+@contextlib.contextmanager
+def _benchmark_backend_flags():
+    cudnn_enabled = torch.backends.cudnn.enabled
+    cudnn_allow_tf32 = torch.backends.cudnn.allow_tf32
+    cuda_matmul_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.enabled = cudnn_enabled
+        torch.backends.cudnn.allow_tf32 = cudnn_allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = cuda_matmul_allow_tf32
 
 
 class ConvTranspose2DBenchmark(base.GenericBenchmark):
@@ -13,9 +32,6 @@ class ConvTranspose2DBenchmark(base.GenericBenchmark):
 
 class ConvTranspose2DBackwardBenchmark(ConvTranspose2DBenchmark):
     pass
-
-
-BENCH_DTYPES = [dtype for dtype in consts.FLOAT_DTYPES if dtype != torch.float32]
 
 
 def _input_fn(shape, dtype, device):
@@ -60,28 +76,28 @@ def _backward_input_fn(shape, dtype, device):
 
 @pytest.mark.conv_transpose2d
 def test_conv_transpose2d():
-    torch.backends.cudnn.allow_tf32 = False
-    bench = ConvTranspose2DBenchmark(
-        input_fn=_input_fn,
-        op_name="conv_transpose2d",
-        torch_op=torch.nn.functional.conv_transpose2d,
-        dtypes=BENCH_DTYPES,
-    )
-    bench.set_gems(flag_gems.conv_transpose2d)
+    with _benchmark_backend_flags():
+        bench = ConvTranspose2DBenchmark(
+            input_fn=_input_fn,
+            op_name="conv_transpose2d",
+            torch_op=torch.nn.functional.conv_transpose2d,
+            dtypes=utils.FLOAT_DTYPES,
+        )
+        bench.set_gems(flag_gems.conv_transpose2d)
 
-    bench.run()
+        bench.run()
 
 
 @pytest.mark.conv_transpose2d_backward
 def test_conv_transpose2d_backward():
-    torch.backends.cudnn.allow_tf32 = False
-    bench = ConvTranspose2DBackwardBenchmark(
-        input_fn=_backward_input_fn,
-        op_name="conv_transpose2d_backward",
-        torch_op=torch.nn.functional.conv_transpose2d,
-        dtypes=BENCH_DTYPES,
-        is_backward=True,
-    )
-    bench.set_gems(flag_gems.conv_transpose2d)
+    with _benchmark_backend_flags():
+        bench = ConvTranspose2DBackwardBenchmark(
+            input_fn=_backward_input_fn,
+            op_name="conv_transpose2d_backward",
+            torch_op=torch.nn.functional.conv_transpose2d,
+            dtypes=utils.FLOAT_DTYPES,
+            is_backward=True,
+        )
+        bench.set_gems(flag_gems.conv_transpose2d)
 
-    bench.run()
+        bench.run()

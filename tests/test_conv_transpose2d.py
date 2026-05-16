@@ -5,7 +5,6 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-
 CONV_TRANSPOSE2D_CASES = [
     ((2, 3, 8, 8), (3, 4, 3, 3), 1, 0, 0, 1, 1),
     ((2, 3, 8, 8), (3, 4, 3, 3), 2, 1, 1, 1, 1),

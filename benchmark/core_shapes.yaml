@@ -315,6 +315,21 @@ Conv2DBenchmark:
     - [16, 32, 24, 24, 24, 3, 3, 1, 1, 2]
   shape_desc: "N, C_in, H, W, C_out, K_h, K_w, stride, padding, groups"
 
+ConvTranspose2DBenchmark:
+  shapes:
+    - [16, 32, 64, 64, 32, 3, 3, 2, 1, 1, 1, 1, 1]
+    - [16, 64, 32, 32, 32, 4, 4, 2, 1, 0, 1, 1, 1]
+    - [8, 64, 64, 64, 32, 3, 3, 1, 1, 0, 1, 1, 2]
+    - [8, 64, 32, 32, 32, 3, 3, 2, 1, 1, 2, 1, 1]
+  shape_desc: "N, C_in, H, W, C_out, K_h, K_w, stride, padding, output_padding, groups, dilation, with_bias"
+
+ConvTranspose2DBackwardBenchmark:
+  shapes:
+    - [16, 32, 64, 64, 32, 3, 3, 2, 1, 1, 1, 1, 1]
+    - [8, 64, 64, 64, 32, 3, 3, 1, 1, 0, 1, 1, 2]
+    - [8, 64, 32, 32, 32, 3, 3, 2, 1, 1, 2, 1, 1]
+  shape_desc: "N, C_in, H, W, C_out, K_h, K_w, stride, padding, output_padding, groups, dilation, with_bias"
+
 Conv3DBenchmark:
   shapes:
     - [32, 64, 64, 64, 64, 32, 3, 3, 3, 1, 1, 1]  # standard dimensions, common parameters

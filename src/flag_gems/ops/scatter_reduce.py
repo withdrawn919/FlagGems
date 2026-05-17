@@ -85,7 +85,8 @@ def _validate_scatter_reduce_args(inp, dim, index, src, reduce):
             )
         if axis != dim and index.size(axis) > inp.size(axis):
             raise RuntimeError(
-                f"Expected index.size({axis}) <= self.size({axis}) for axis != dim, got {index.size(axis)} > {inp.size(axis)}"
+                f"Expected index.size({axis}) <= self.size({axis}) for axis != dim, "
+                f"got {index.size(axis)} > {inp.size(axis)}"
             )
     return dim
 

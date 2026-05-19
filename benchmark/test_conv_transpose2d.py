@@ -1,5 +1,3 @@
-import contextlib
-
 import pytest
 import torch
 
@@ -9,40 +7,29 @@ from tests import accuracy_utils as utils
 from . import base
 
 
-@contextlib.contextmanager
-def _temporary_backend_attr(backend, name, value):
+def _set_backend_attr(backend, name, value, saved_attrs):
     if backend is None or not hasattr(backend, name):
-        yield
         return
 
-    old_value = getattr(backend, name)
+    saved_attrs.append((backend, name, getattr(backend, name)))
     setattr(backend, name, value)
-    try:
-        yield
-    finally:
-        setattr(backend, name, old_value)
 
 
-@contextlib.contextmanager
-def _benchmark_backend_flags():
-    with contextlib.ExitStack() as stack:
-        cudnn_backend = getattr(torch.backends, "cudnn", None)
-        if cudnn_backend is not None and hasattr(cudnn_backend, "flags"):
-            stack.enter_context(cudnn_backend.flags(enabled=False, allow_tf32=False))
-        else:
-            stack.enter_context(
-                _temporary_backend_attr(cudnn_backend, "enabled", False)
-            )
-            stack.enter_context(
-                _temporary_backend_attr(cudnn_backend, "allow_tf32", False)
-            )
+def _disable_benchmark_backend_flags():
+    saved_attrs = []
+    cudnn_backend = getattr(torch.backends, "cudnn", None)
+    _set_backend_attr(cudnn_backend, "enabled", False, saved_attrs)
+    _set_backend_attr(cudnn_backend, "allow_tf32", False, saved_attrs)
 
-        cuda_backend = getattr(torch.backends, "cuda", None)
-        cuda_matmul_backend = getattr(cuda_backend, "matmul", None)
-        stack.enter_context(
-            _temporary_backend_attr(cuda_matmul_backend, "allow_tf32", False)
-        )
-        yield
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    cuda_matmul_backend = getattr(cuda_backend, "matmul", None)
+    _set_backend_attr(cuda_matmul_backend, "allow_tf32", False, saved_attrs)
+    return saved_attrs
+
+
+def _restore_backend_flags(saved_attrs):
+    for backend, name, value in reversed(saved_attrs):
+        setattr(backend, name, value)
 
 
 class ConvTranspose2DBenchmark(base.GenericBenchmark):
@@ -96,7 +83,8 @@ def _backward_input_fn(shape, dtype, device):
 
 @pytest.mark.conv_transpose2d
 def test_conv_transpose2d():
-    with _benchmark_backend_flags():
+    saved_attrs = _disable_benchmark_backend_flags()
+    try:
         bench = ConvTranspose2DBenchmark(
             input_fn=_input_fn,
             op_name="conv_transpose2d",
@@ -106,11 +94,14 @@ def test_conv_transpose2d():
         bench.set_gems(flag_gems.conv_transpose2d)
 
         bench.run()
+    finally:
+        _restore_backend_flags(saved_attrs)
 
 
 @pytest.mark.conv_transpose2d_backward
 def test_conv_transpose2d_backward():
-    with _benchmark_backend_flags():
+    saved_attrs = _disable_benchmark_backend_flags()
+    try:
         bench = ConvTranspose2DBackwardBenchmark(
             input_fn=_backward_input_fn,
             op_name="conv_transpose2d_backward",
@@ -121,3 +112,5 @@ def test_conv_transpose2d_backward():
         bench.set_gems(flag_gems.conv_transpose2d)
 
         bench.run()
+    finally:
+        _restore_backend_flags(saved_attrs)

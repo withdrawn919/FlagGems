@@ -217,7 +217,10 @@ def _scatter_reduce_lastdim_identity(out, dim, index, src, reduce, include_self)
     del index
     block_rows = 8
     block_cols = 128
-    grid = (triton.cdiv(src.shape[0], block_rows), triton.cdiv(src.shape[1], block_cols))
+    grid = (
+        triton.cdiv(src.shape[0], block_rows),
+        triton.cdiv(src.shape[1], block_cols),
+    )
     _scatter_reduce_lastdim_identity_2d_kernel[grid](
         out,
         src,
@@ -237,11 +240,16 @@ def _scatter_reduce_lastdim_identity(out, dim, index, src, reduce, include_self)
     return out
 
 
-def _scatter_reduce_lastdim_identity_out(inp, out, dim, index, src, reduce, include_self):
+def _scatter_reduce_lastdim_identity_out(
+    inp, out, dim, index, src, reduce, include_self
+):
     del dim, index
     block_rows = 8
     block_cols = 128
-    grid = (triton.cdiv(inp.shape[0], block_rows), triton.cdiv(inp.shape[1], block_cols))
+    grid = (
+        triton.cdiv(inp.shape[0], block_rows),
+        triton.cdiv(inp.shape[1], block_cols),
+    )
     _scatter_reduce_lastdim_identity_out_2d_kernel[grid](
         inp,
         out,

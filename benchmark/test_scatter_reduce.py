@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import flag_gems
 from flag_gems.utils import shape_utils
 
 from . import base, consts
@@ -189,6 +190,7 @@ def test_scatter_reduce_two(op_name, reduce, include_self):
         get_gbps=gather_scatter_gbps,
         dtypes=consts.FLOAT_DTYPES,
     )
+    bench.set_gems(flag_gems.scatter_reduce)
     bench.run()
 
 
@@ -205,6 +207,7 @@ def test_scatter_reduce_two_(op_name, reduce, include_self):
         dtypes=consts.FLOAT_DTYPES,
         is_inplace=True,
     )
+    bench.set_gems(flag_gems.scatter_reduce_)
     bench.run()
 
 
@@ -218,4 +221,5 @@ def test_scatter_reduce_two_out(op_name, reduce, include_self):
         get_gbps=gather_scatter_gbps,
         dtypes=consts.FLOAT_DTYPES,
     )
+    bench.set_gems(flag_gems.scatter_reduce_out)
     bench.run()
